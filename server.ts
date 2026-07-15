@@ -1,12 +1,12 @@
 import express from "express";
 import path from "path";
 import crypto from "crypto";
+import nodemailer from "nodemailer";
 import { createServer as createViteServer } from "vite";
 import { db } from "./src/db/index.ts";
-import { menuItems, orders, staff, users, auditLogs } from "./src/db/schema.ts";
+import { menuItems, orders, staff, users, auditLogs, sellers } from "./src/db/schema.ts";
 import { eq } from "drizzle-orm";
 import { requireAuth, AuthRequest } from "./src/middleware/auth.ts";
-import nodemailer from "nodemailer";
 
 async function startServer() {
   const app = express();
@@ -32,139 +32,113 @@ async function startServer() {
   });
 
   // =============================================================
-  // REAL EMAIL AUTHENTICATION & 2FA ENGINE
+  // GMAIL SMTP MAIL TRANSPORT SERVICE
+  // =============================================================
+  const getTransporter = () => {
+    const user = process.env.GMAIL_USER;
+    const pass = process.env.GMAIL_APP_PASSWORD;
+    if (!user || !pass) {
+      console.warn("⚠️ [SMTP] GMAIL_USER and GMAIL_APP_PASSWORD environment variables are not set. Gmail SMTP is disabled.");
+      return null;
+    }
+    return nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user,
+        pass,
+      },
+    });
+  };
+
+  const sendSystemEmail = async (to: string, subject: string, htmlContent: string) => {
+    const transporter = getTransporter();
+    if (!transporter) {
+      console.warn(`⚠️ [SMTP] Transporter unconfigured. Bypassed email sending to: ${to}`);
+      console.log(`Subject: ${subject}`);
+      return false;
+    }
+    try {
+      await transporter.sendMail({
+        from: `"Seller Portal Support" <${process.env.GMAIL_USER}>`,
+        to,
+        subject,
+        html: htmlContent,
+      });
+      console.log(`✓ [SMTP] Email successfully sent to: ${to}`);
+      return true;
+    } catch (error) {
+      console.error(`❌ [SMTP Error] Failed sending email to ${to}:`, error);
+      throw error;
+    }
+  };
+
+  // =============================================================
+  // REAL-TIME LOCAL BYPASS AUTHENTICATION & 2FA ENGINE
   // =============================================================
   const otpStore = new Map<string, { otp: string; expiresAt: number }>();
-  let emailTransporter: any = null;
+  const pendingRegistrations = new Map<string, {
+    token: string;
+    emailVerified: boolean;
+    otp: string;
+    otpExpiresAt: number;
+    businessName: string;
+    ownerName: string;
+    phone: string;
+    password: string;
+    role: string;
+  }>();
+  const forgotPasswordStore = new Map<string, {
+    otp: string;
+    otpExpiresAt: number;
+    otpVerified: boolean;
+  }>();
 
-  async function getTransporter() {
-    if (emailTransporter) return emailTransporter;
-
-    const gmailUser = process.env.GMAIL_USER;
-    const gmailPass = process.env.GMAIL_APP_PASSWORD;
-
-    const host = process.env.SMTP_HOST;
-    const port = process.env.SMTP_PORT;
-    const user = process.env.SMTP_USER;
-    const pass = process.env.SMTP_PASS;
-
-    if (gmailUser && gmailPass) {
-      console.log(`[Email Engine] Configuring secure Gmail SMTP using Google App credentials: ${gmailUser}`);
-      emailTransporter = nodemailer.createTransport({
-        service: "gmail",
-        auth: {
-          user: gmailUser,
-          pass: gmailPass,
-        },
-      });
-    } else if (host && port && user && pass) {
-      console.log(`[Email Engine] Configuring secure SMTP client using custom credentials: ${host}:${port}`);
-      emailTransporter = nodemailer.createTransport({
-        host,
-        port: Number(port),
-        secure: Number(port) === 465, // true for port 465, false for 587 or 25
-        auth: { user, pass },
-      });
-    } else {
-      throw new Error("No custom SMTP credentials or Gmail credentials detected in environment. Please configure GMAIL_USER and GMAIL_APP_PASSWORD, or SMTP_HOST, SMTP_PORT, SMTP_USER, and SMTP_PASS.");
-    }
-    return emailTransporter;
-  }
-
-  async function sendEmailRobust({ to, subject, text, html }: { to: string; subject: string; text: string; html: string }) {
-    let transporter = await getTransporter();
-    let senderEmail = process.env.SMTP_FROM || (process.env.GMAIL_USER ? `"Food Ordering System" <${process.env.GMAIL_USER}>` : '"Food Ordering System" <no-reply@foodsystem.com>');
-
-    const info = await transporter.sendMail({
-      from: senderEmail,
-      to,
-      subject,
-      text,
-      html
-    });
-    
-    return { info, previewUrl: "", isFallback: false, fallbackError: undefined as string | undefined };
-  }
-
-  // 1. Send OTP 2FA Code via email
+  // 1. Send OTP 2FA Code via Gmail SMTP (or fallback local bypass)
   app.post("/api/auth/send-otp", async (req, res) => {
     const { email, type } = req.body;
     if (!email) {
       return res.status(400).json({ error: "Email address is required" });
     }
 
+    const emailLower = email.toLowerCase();
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     try {
       const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes expiration
-      otpStore.set(email.toLowerCase(), { otp, expiresAt });
+      otpStore.set(emailLower, { otp, expiresAt });
 
       const isRegister = type === 'register';
-      const subject = isRegister 
-        ? `${otp} is your Food System Registration Verification Code 🛡️`
-        : `${otp} is your Food System 2FA Verification Code 🛡️`;
-      
-      const emailTitle = isRegister ? "Create Your Seller Partner Account" : "Sign-In Identity Verification";
-      const emailMessage = isRegister
-        ? "Thank you for registering to join our platform. To verify your email address and activate your Seller Partner account, please enter the following 6-digit security pin:"
-        : "We detected a login attempt for your Seller account. Please enter the following 6-digit security pin in your browser to complete verification:";
+      console.log(`[Security Engine] Generated ${isRegister ? 'Registration' : '2FA'} code [ ${otp} ] for user: ${emailLower}`);
 
-      console.log(`[Email Engine] Transmitting ${isRegister ? 'Registration' : '2FA'} verification email to: ${email}`);
-
-      const emailHtml = `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e5e7eb; border-radius: 16px; background-color: #ffffff; color: #1f2937; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);">
-          <div style="text-align: center; margin-bottom: 24px; border-bottom: 2px solid #f3f4f6; padding-bottom: 16px;">
-            <h1 style="font-size: 24px; color: #4f46e5; margin: 0; font-weight: bold; letter-spacing: -0.025em;">Food System</h1>
-            <p style="font-size: 12px; color: #6b7280; margin: 4px 0 0 0; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em;">Seller Portal Security</p>
+      const subject = "Your Secure 2FA Login PIN - Seller Partner Portal";
+      const body = `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 30px; background-color: #0f172a; border-radius: 20px; border: 1px solid #1e293b; color: #f8fafc;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <span style="font-size: 40px;">🛡️</span>
+            <h2 style="color: #6366f1; margin: 10px 0 0 0; font-size: 24px; font-weight: 800;">Two-Factor Authentication</h2>
           </div>
-          <div style="padding: 8px 0;">
-            <p style="font-size: 16px; font-weight: 600; color: #111827; margin: 0 0 12px 0;">${emailTitle}</p>
-            <p style="font-size: 14px; line-height: 1.6; color: #4b5563; margin: 0 0 24px 0;">
-              ${emailMessage}
-            </p>
-            
-            <div style="text-align: center; margin: 32px 0; padding: 24px; background-color: #f8fafc; border: 1px dashed #e2e8f0; border-radius: 16px;">
-              <span style="font-family: 'Courier New', Courier, monospace; font-size: 38px; font-weight: 800; letter-spacing: 8px; color: #1e1b4b; display: inline-block;">
-                ${otp}
-              </span>
-            </div>
-            
-            <p style="font-size: 13px; color: #dc2626; font-weight: 600; margin: 0 0 16px 0; display: flex; items-center: center; gap: 4px;">
-              ⚠️ Code expires in 5 minutes. Never share this pin code with any third party.
-            </p>
-            <p style="font-size: 14px; line-height: 1.6; color: #4b5563; margin: 0 0 16px 0;">
-              If you did not request this, you can safely ignore this email.
-            </p>
+          <p style="font-size: 15px; line-height: 1.6; color: #cbd5e1; margin-bottom: 24px;">
+            Please use the following 6-digit verification security PIN to complete your login:
+          </p>
+          <div style="background-color: #020617; padding: 24px; border-radius: 16px; text-align: center; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #f59e0b; margin: 28px 0; border: 1px solid #1e293b; font-family: monospace;">
+            ${otp}
           </div>
-          <div style="text-align: center; border-top: 1px solid #f3f4f6; padding-top: 16px; margin-top: 24px; font-size: 11px; color: #9ca3af; line-height: 1.5;">
-            <p style="margin: 0;">This is an automated transactional security alert. Do not reply.</p>
-            <p style="margin: 4px 0 0 0;">Food Ordering System Seller Portal • Data Privacy Act Compliant</p>
-          </div>
+          <p style="color: #94a3b8; font-size: 12px; text-align: center;">
+            This security code is highly sensitive and is valid for exactly 5 minutes.
+          </p>
         </div>
       `;
 
-      const result = await sendEmailRobust({
-        to: email,
-        subject: subject,
-        text: `Your verification code is: ${otp}. It will expire in 5 minutes.`,
-        html: emailHtml
-      });
+      const emailSent = await sendSystemEmail(emailLower, subject, body);
 
       res.json({ 
         success: true, 
-        previewUrl: result.previewUrl,
-        isFallback: result.isFallback,
-        fallbackError: result.isFallback ? result.fallbackError : undefined
-      });
-    } catch (error: any) {
-      console.warn("[Email Engine] Error sending OTP verification email. Using secure local bypass...", error);
-      // Fallback response with the code directly so user can complete registration/login in testing/demo env
-      res.json({ 
-        success: true, 
         previewUrl: "",
-        isFallback: true,
-        fallbackError: error.message || String(error),
+        isFallback: !emailSent,
         localBypassOtp: otp
       });
+    } catch (error: any) {
+      console.error("[Security Engine] Error generating OTP:", error);
+      res.status(500).json({ error: "Failed to generate security code" });
     }
   });
 
@@ -186,7 +160,7 @@ async function startServer() {
     }
 
     if (record.otp !== otp) {
-      return res.status(400).json({ error: "Incorrect verification code. Please check your email and try again." });
+      return res.status(400).json({ error: "Incorrect verification code. Please check and try again." });
     }
 
     // Success! Consume code
@@ -194,73 +168,463 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // 3. Forgot Password Link Dispatched via email
-  app.post("/api/auth/forgot-password", async (req, res) => {
+  // 3. REGISTRATION FLOW - Initialize Verification
+  app.post("/api/auth/register-init", async (req, res) => {
+    const { email, phone, businessName, ownerName, password, role } = req.body;
+    if (!email || !phone || !businessName || !ownerName || !password) {
+      return res.status(400).json({ error: "All registration fields are required" });
+    }
+
+    const emailLower = email.toLowerCase();
+
+    // Check if email already registered in users or staff
+    try {
+      const existingUser = await db.select().from(users).where(eq(users.email, emailLower)).limit(1);
+      const existingStaff = await db.select().from(staff).where(eq(staff.email, emailLower)).limit(1);
+      if (existingUser.length > 0 || existingStaff.length > 0) {
+        return res.status(400).json({ error: "This email is already registered." });
+      }
+    } catch (err: any) {
+      console.warn("Error checking existing registration email:", err.message);
+    }
+
+    const token = crypto.randomBytes(16).toString("hex");
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpExpiresAt = Date.now() + 3 * 60 * 1000; // 3-minute OTP countdown
+
+    pendingRegistrations.set(emailLower, {
+      token,
+      emailVerified: false,
+      otp,
+      otpExpiresAt,
+      businessName,
+      ownerName,
+      phone,
+      password,
+      role: role || 'Manager/Owner'
+    });
+
+    const host = req.get("host") || "localhost:3000";
+    const protocol = req.secure || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
+    const verificationLink = `${protocol}://${host}/api/auth/verify-link?email=${encodeURIComponent(emailLower)}&token=${token}`;
+
+    console.log(`[Registration Engine] Initiated for: ${emailLower}. Token: ${token}, OTP: ${otp}`);
+    console.log(`[Registration Link] Link: ${verificationLink}`);
+
+    const emailSubject = "Verify Your Business Registration - Seller Partner Portal";
+    const emailBody = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 30px; background-color: #0f172a; border-radius: 20px; border: 1px solid #1e293b; color: #f8fafc;">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <span style="font-size: 40px;">🏪</span>
+          <h2 style="color: #6366f1; margin: 10px 0 0 0; font-size: 24px; font-weight: 800;">Seller Partner Portal</h2>
+        </div>
+        <p style="font-size: 16px; line-height: 1.6; color: #cbd5e1; margin-bottom: 20px;">
+          Hello <strong>${ownerName}</strong>,
+        </p>
+        <p style="font-size: 15px; line-height: 1.6; color: #cbd5e1; margin-bottom: 24px;">
+          Thank you for registering <strong>${businessName}</strong>. To secure your account and proceed with registration, please click the verification button below:
+        </p>
+        <div style="text-align: center; margin: 32px 0;">
+          <a href="${verificationLink}" style="background-color: #4f46e5; color: #ffffff; padding: 14px 30px; text-decoration: none; border-radius: 12px; font-weight: 700; font-size: 15px; display: inline-block; box-shadow: 0 4px 15px rgba(79, 70, 229, 0.4); transition: background-color 0.2s;">
+            Verify Email Address ✓
+          </a>
+        </div>
+        <p style="font-size: 13px; line-height: 1.6; color: #94a3b8; margin-top: 30px; border-top: 1px solid #1e293b; padding-top: 20px;">
+          If the button above does not work, copy and paste this link in your browser:
+          <br/>
+          <a href="${verificationLink}" style="color: #818cf8; word-break: break-all;">${verificationLink}</a>
+        </p>
+        <p style="font-size: 12px; color: #64748b; text-align: center; margin-top: 40px;">
+          This link is highly secure and valid only for your active registration session.
+        </p>
+      </div>
+    `;
+
+    try {
+      const emailSent = await sendSystemEmail(emailLower, emailSubject, emailBody);
+      res.json({
+        success: true,
+        email: emailLower,
+        localBypassLink: !emailSent ? verificationLink : null,
+        localBypassOtp: !emailSent ? otp : null
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to dispatch email verification link. " + err.message });
+    }
+  });
+
+  // 4. Poll Email Verification Status
+  app.get("/api/auth/check-verification", (req, res) => {
+    const email = (req.query.email as string || '').toLowerCase();
+    const reg = pendingRegistrations.get(email);
+    if (!reg) {
+      return res.status(404).json({ error: "Registration session not found or expired" });
+    }
+    res.json({ verified: reg.emailVerified });
+  });
+
+  // 5. GET Verification Link Action clicked in email
+  app.get("/api/auth/verify-link", async (req, res) => {
+    const email = (req.query.email as string || '').toLowerCase();
+    const token = req.query.token as string || '';
+    const reg = pendingRegistrations.get(email);
+
+    if (!reg || reg.token !== token) {
+      return res.send(`
+        <html>
+          <head>
+            <title>Verification Error</title>
+            <style>
+              body { font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #0a0a0a; color: #f8fafc; }
+              .card { background-color: #0f172a; padding: 40px; border-radius: 20px; border: 1px solid #1e293b; text-align: center; max-width: 440px; }
+              h2 { color: #f43f5e; margin: 0 0 12px 0; }
+              p { color: #94a3b8; font-size: 14px; line-height: 1.6; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h2>⚠️ Invalid or Expired Verification Link</h2>
+              <p>The security token is invalid or the registration session has expired. Please return to the portal and register again.</p>
+            </div>
+          </body>
+        </html>
+      `);
+    }
+
+    // Update state to Verified
+    reg.emailVerified = true;
+
+    // Send 6-Digit OTP via Gmail SMTP instantly
+    const otpSubject = "Your Security Verification OTP Code";
+    const otpBody = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 30px; background-color: #0f172a; border-radius: 20px; border: 1px solid #1e293b; color: #f8fafc;">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <span style="font-size: 40px;">🛡️</span>
+          <h2 style="color: #6366f1; margin: 10px 0 0 0; font-size: 24px; font-weight: 800;">Email Verified Successfully!</h2>
+        </div>
+        <p style="font-size: 15px; line-height: 1.6; color: #cbd5e1; margin-bottom: 20px;">
+          Hi <strong>${reg.ownerName}</strong>,
+        </p>
+        <p style="font-size: 15px; line-height: 1.6; color: #cbd5e1; margin-bottom: 24px;">
+          Your email address has been successfully verified! Please enter the 6-digit OTP security code below in your registration terminal screen to complete your registration:
+        </p>
+        <div style="background-color: #020617; padding: 24px; border-radius: 16px; text-align: center; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #f59e0b; margin: 28px 0; border: 1px solid #1e293b; font-family: monospace;">
+          ${reg.otp}
+        </div>
+        <p style="color: #ef4444; font-size: 13px; text-align: center; font-weight: 600;">
+          ⚠️ This code is valid for exactly 3 minutes.
+        </p>
+      </div>
+    `;
+
+    try {
+      await sendSystemEmail(email, otpSubject, otpBody);
+    } catch (smtpErr) {
+      console.error("[SMTP OTP dispatch failed during verification]", smtpErr);
+    }
+
+    res.send(`
+      <html>
+        <head>
+          <title>Email Verification Successful</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #090d16; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+            .card { background-color: #0f172a; border: 1px solid #1e293b; padding: 50px 40px; border-radius: 24px; text-align: center; max-width: 480px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5); }
+            .badge { display: inline-block; background-color: #065f46; color: #34d399; padding: 6px 14px; border-radius: 9999px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 20px; }
+            h2 { margin: 0 0 16px 0; font-size: 26px; font-weight: 800; color: #38bdf8; }
+            p { color: #94a3b8; font-size: 15px; line-height: 1.6; margin-bottom: 30px; }
+            .instruction { background-color: #020617; border: 1px solid #1e293b; padding: 12px 20px; border-radius: 12px; color: #fbbf24; font-size: 13px; font-weight: 600; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <span class="badge">Verified ✓</span>
+            <h2>Email Verification Successful</h2>
+            <p>Your email address has been successfully verified! A 6-digit OTP security code has been transmitted to your email inbox. Please go back to your registration terminal screen to input the code and complete registration.</p>
+            <div class="instruction">ℹ️ Please do not close your original registration terminal tab.</div>
+          </div>
+        </body>
+      </html>
+    `);
+  });
+
+  // 6. Verify Registration OTP and Complete
+  app.post("/api/auth/register-verify-otp", async (req, res) => {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ error: "Email and OTP code are required" });
+    }
+
+    const emailLower = email.toLowerCase();
+    const reg = pendingRegistrations.get(emailLower);
+    if (!reg) {
+      return res.status(400).json({ error: "Registration session has expired or was not found. Please try again." });
+    }
+
+    if (Date.now() > reg.otpExpiresAt) {
+      pendingRegistrations.delete(emailLower);
+      return res.status(400).json({ error: "This OTP verification code has expired (valid for 3 minutes). Please try registering again." });
+    }
+
+    if (reg.otp !== otp) {
+      return res.status(400).json({ error: "Incorrect verification PIN. Please verify your email inbox and try again." });
+    }
+
+    // Complete Registration Success
+    pendingRegistrations.delete(emailLower);
+
+    // Save to the correct table based on role
+    try {
+      const isStaffRole = reg.role === 'Staff';
+      if (isStaffRole) {
+        const existing = await db.select().from(staff).where(eq(staff.email, emailLower)).limit(1);
+        if (existing.length > 0) {
+          await db.update(staff).set({
+            name: reg.ownerName,
+            role: reg.role || 'Staff',
+            phone: reg.phone,
+            businessName: reg.businessName,
+            password: reg.password,
+            updatedAt: new Date()
+          }).where(eq(staff.id, existing[0].id));
+        } else {
+          const uid = `stf_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          await db.insert(staff).values({
+            uid,
+            email: emailLower,
+            name: reg.ownerName,
+            role: reg.role || 'Staff',
+            phone: reg.phone,
+            businessName: reg.businessName,
+            password: reg.password,
+            pin: '1234', // Default placeholder PIN
+            status: 'active'
+          });
+        }
+        console.log(`[Database] Staff registered/updated in staff table: ${emailLower}`);
+      } else {
+        const existing = await db.select().from(users).where(eq(users.email, emailLower)).limit(1);
+        if (existing.length > 0) {
+          await db.update(users).set({
+            name: reg.ownerName,
+            role: reg.role || 'Manager/Owner',
+            phone: reg.phone,
+            businessName: reg.businessName,
+            password: reg.password,
+            updatedAt: new Date()
+          }).where(eq(users.id, existing[0].id));
+        } else {
+          const uid = `usr_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          await db.insert(users).values({
+            uid,
+            email: emailLower,
+            name: reg.ownerName,
+            role: reg.role || 'Manager/Owner',
+            phone: reg.phone,
+            businessName: reg.businessName,
+            password: reg.password,
+          });
+        }
+        console.log(`[Database] Manager/Owner registered/updated in users table: ${emailLower}`);
+      }
+    } catch (dbErr: any) {
+      console.error(`[Database Error] Failed to persist registered user:`, dbErr.message);
+    }
+
+    res.json({
+      success: true,
+      seller: {
+        email: emailLower,
+        phone: reg.phone,
+        businessName: reg.businessName,
+        ownerName: reg.ownerName,
+        password: reg.password,
+        role: reg.role || 'Manager/Owner'
+      }
+    });
+  });
+
+  // 7. FORGOT PASSWORD - Request OTP Code
+  app.post("/api/auth/forgot-password-otp", async (req, res) => {
     const { email } = req.body;
     if (!email) {
       return res.status(400).json({ error: "Email address is required" });
     }
 
-    const resetLink = `https://${req.get("host") || "localhost:3000"}/#reset-password?email=${encodeURIComponent(email)}&token=${crypto.randomBytes(16).toString("hex")}`;
-    try {
-      console.log(`[Email Engine] Sending password reset link email to: ${email}`);
+    const emailLower = email.toLowerCase();
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otpExpiresAt = Date.now() + 3 * 60 * 1000; // 3-minute OTP countdown
 
-      const emailHtml = `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e5e7eb; border-radius: 16px; background-color: #ffffff; color: #1f2937;">
-          <div style="text-align: center; margin-bottom: 24px; border-bottom: 2px solid #f3f4f6; padding-bottom: 16px;">
-            <h1 style="font-size: 24px; color: #4f46e5; margin: 0; font-weight: bold; letter-spacing: -0.025em;">Food System</h1>
-            <p style="font-size: 12px; color: #6b7280; margin: 4px 0 0 0; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em;">Seller Portal Security</p>
-          </div>
-          <div style="padding: 8px 0;">
-            <p style="font-size: 16px; font-weight: 600; color: #111827; margin: 0 0 12px 0;">Password Reset Request</p>
-            <p style="font-size: 14px; line-height: 1.6; color: #4b5563; margin: 0 0 24px 0;">
-              We received a request to reset your password for your Seller Portal account. Click the button below to establish a new password:
-            </p>
-            
-            <div style="text-align: center; margin: 32px 0;">
-              <a href="${resetLink}" target="_blank" style="background-color: #4f46e5; color: #ffffff; padding: 12px 24px; text-decoration: none; font-size: 14px; font-weight: bold; border-radius: 8px; display: inline-block;">
-                Reset Account Password
-              </a>
-            </div>
-            
-            <p style="font-size: 12px; color: #6b7280; word-break: break-all; margin: 0 0 16px 0;">
-              Or copy and paste this link in your browser: <br/>
-              <a href="${resetLink}" style="color: #4f46e5; text-decoration: underline;">${resetLink}</a>
-            </p>
-            
-            <p style="font-size: 13px; color: #6b7280; margin: 0 0 16px 0;">
-              Note: This secure link will expire in 1 hour. If you did not request a password change, please ignore this email.
-            </p>
-          </div>
-          <div style="text-align: center; border-top: 1px solid #f3f4f6; padding-top: 16px; margin-top: 24px; font-size: 11px; color: #9ca3af; line-height: 1.5;">
-            <p style="margin: 0;">This is an automated transactional security alert. Do not reply.</p>
-            <p style="margin: 4px 0 0 0;">Food Ordering System Seller Portal • Data Privacy Act Compliant</p>
-          </div>
+    forgotPasswordStore.set(emailLower, {
+      otp,
+      otpExpiresAt,
+      otpVerified: false
+    });
+
+    console.log(`[Forgot Password OTP] Generated code [ ${otp} ] for user: ${emailLower}`);
+
+    const emailSubject = "Your Password Recovery OTP Code - Seller Partner Portal";
+    const emailBody = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 30px; background-color: #0f172a; border-radius: 20px; border: 1px solid #1e293b; color: #f8fafc;">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <span style="font-size: 40px;">🔑</span>
+          <h2 style="color: #ef4444; margin: 10px 0 0 0; font-size: 24px; font-weight: 800;">Password Recovery</h2>
         </div>
-      `;
+        <p style="font-size: 15px; line-height: 1.6; color: #cbd5e1; margin-bottom: 20px;">
+          Hello,
+        </p>
+        <p style="font-size: 15px; line-height: 1.6; color: #cbd5e1; margin-bottom: 24px;">
+          We received a request to reset the password for your Seller Partner account. Please use the following 6-digit OTP code to verify your identity:
+        </p>
+        <div style="background-color: #020617; padding: 24px; border-radius: 16px; text-align: center; font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #f59e0b; margin: 28px 0; border: 1px solid #1e293b; font-family: monospace;">
+          ${otp}
+        </div>
+        <p style="color: #ef4444; font-size: 13px; text-align: center; font-weight: 600;">
+          ⚠️ This code is valid for exactly 3 minutes.
+        </p>
+        <p style="font-size: 13px; color: #94a3b8; line-height: 1.6; margin-top: 30px; border-top: 1px solid #1e293b; padding-top: 20px;">
+          If you did not request a password reset, you can safely ignore this email. Your password will remain unchanged.
+        </p>
+      </div>
+    `;
 
-      const result = await sendEmailRobust({
-        to: email,
-        subject: `Reset your Food System Seller Portal Password 🔑`,
-        text: `Please reset your password by clicking this link: ${resetLink}`,
-        html: emailHtml
+    try {
+      const emailSent = await sendSystemEmail(emailLower, emailSubject, emailBody);
+      res.json({
+        success: true,
+        email: emailLower,
+        localBypassOtp: !emailSent ? otp : null
       });
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to dispatch password recovery OTP. " + err.message });
+    }
+  });
 
-      res.json({ 
-        success: true, 
-        previewUrl: result.previewUrl,
-        isFallback: result.isFallback,
-        fallbackError: result.isFallback ? result.fallbackError : undefined
-      });
-    } catch (error: any) {
-      console.warn("[Email Engine] Error sending password reset email. Using secure local bypass...", error);
-      res.json({ 
-        success: true, 
-        previewUrl: "", 
-        isFallback: true, 
-        fallbackError: error.message || String(error),
-        localBypassResetLink: resetLink
-      });
+  // 8. FORGOT PASSWORD - Verify OTP
+  app.post("/api/auth/forgot-verify-otp", (req, res) => {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ error: "Email and OTP code are required" });
+    }
+
+    const emailLower = email.toLowerCase();
+    const record = forgotPasswordStore.get(emailLower);
+    if (!record) {
+      return res.status(400).json({ error: "No active recovery session was found for this email address" });
+    }
+
+    if (Date.now() > record.otpExpiresAt) {
+      forgotPasswordStore.delete(emailLower);
+      return res.status(400).json({ error: "Your OTP recovery code has expired (valid for 3 minutes). Please request a new code." });
+    }
+
+    if (record.otp !== otp) {
+      return res.status(400).json({ error: "Incorrect OTP code. Please check your email inbox and try again." });
+    }
+
+    record.otpVerified = true;
+    res.json({ success: true });
+  });
+
+  // 9. FORGOT PASSWORD - Save New Password
+  app.post("/api/auth/reset-password-save", async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and new password are required" });
+    }
+
+    const emailLower = email.toLowerCase();
+    const record = forgotPasswordStore.get(emailLower);
+    if (!record || !record.otpVerified) {
+      return res.status(400).json({ error: "Unauthorized password reset attempt. Please complete OTP verification first." });
+    }
+
+    forgotPasswordStore.delete(emailLower);
+
+    try {
+      // Update in users table
+      await db.update(users)
+        .set({ password, updatedAt: new Date() })
+        .where(eq(users.email, emailLower));
+
+      // Update in staff table
+      await db.update(staff)
+        .set({ password, updatedAt: new Date() })
+        .where(eq(staff.email, emailLower));
+
+      console.log(`[Database] Seller password successfully updated in database: ${emailLower}`);
+      res.json({ success: true, message: "Password updated successfully!" });
+    } catch (dbErr: any) {
+      console.error("[Database Error] Could not update seller password:", dbErr.message);
+      res.status(500).json({ error: "Database error updating password" });
+    }
+  });
+
+  // 10. GET ALL REGISTERED SELLERS (Sync with client local state)
+  app.get("/api/auth/sellers", async (req, res) => {
+    try {
+      const allUsers = await db.select().from(users);
+      const allStaff = await db.select().from(staff);
+
+      const combinedSellers: any[] = [];
+
+      // Add registered users (Managers) who have a password set
+      for (const u of allUsers) {
+        if (u.password) {
+          combinedSellers.push({
+            email: u.email,
+            phone: u.phone,
+            businessName: u.businessName,
+            ownerName: u.name,
+            password: u.password,
+            role: u.role || 'Manager/Owner',
+            photoUrl: u.photoUrl
+          });
+        }
+      }
+
+      // Add registered staff who have a password set
+      for (const s of allStaff) {
+        if (s.password && s.email) {
+          combinedSellers.push({
+            email: s.email,
+            phone: s.phone,
+            businessName: s.businessName,
+            ownerName: s.name,
+            password: s.password,
+            role: s.role || 'Staff',
+            photoUrl: s.photoUrl
+          });
+        }
+      }
+
+      res.json({ success: true, sellers: combinedSellers });
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to fetch registered sellers: " + err.message });
+    }
+  });
+
+  // 11. UPDATE SELLER PROFILE PICTURE
+  app.post("/api/auth/update-profile-picture", async (req, res) => {
+    const { email, photoUrl } = req.body;
+    if (!email || !photoUrl) {
+      return res.status(400).json({ error: "Email and photoUrl are required" });
+    }
+    try {
+      // Update in users table
+      await db.update(users)
+        .set({ photoUrl, updatedAt: new Date() })
+        .where(eq(users.email, email.toLowerCase()));
+
+      // Update in staff table
+      await db.update(staff)
+        .set({ photoUrl, updatedAt: new Date() })
+        .where(eq(staff.email, email.toLowerCase()));
+
+      console.log(`[Database] Profile picture updated for seller: ${email}`);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to update profile picture: " + err.message });
     }
   });
 

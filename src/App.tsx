@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Plus, Edit, Trash2, Shield, Users, BarChart3, Database, Wifi, WifiOff,
-  Printer, Moon, Sun, ShoppingCart, User, Key, Clock, Utensils,
+  Printer, Moon, Sun, ShoppingCart, User, Key, KeyRound, Clock, Utensils,
   TrendingUp, CheckCircle2, AlertTriangle, Search, Lock, Unlock, 
   Volume2, RefreshCw, X, ClipboardList, Info, Users2, DollarSign, Smartphone,
   Eye, EyeOff, Mail, ChevronRight, Download, VolumeX, Battery, Home, Power, MessageSquare, FileText, Cookie, LogOut
@@ -87,6 +87,8 @@ export default function App() {
   const [dbRegistered, setDbRegistered] = useState<boolean>(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('idle');
   const [lastSyncText, setLastSyncText] = useState<string>('Not synchronized yet');
+  const [mainServerOnline, setMainServerOnline] = useState<boolean>(false);
+  const [checkingMainServer, setCheckingMainServer] = useState<boolean>(false);
 
   // Employee Login State (PIN authentication)
   const [currentEmployee, setCurrentEmployee] = useState<StaffMember | null>(null);
@@ -152,8 +154,11 @@ export default function App() {
   const [showCookiePolicyModal, setShowCookiePolicyModal] = useState<boolean>(false);
 
   // Seller Portal Auth States (Gating screen)
-  const [sellerAuthUser, setSellerAuthUser] = useState<{ email: string; businessName: string; ownerName: string; phone: string; photoUrl?: string } | null>(null);
-  const [sellerAuthView, setSellerAuthView] = useState<'login' | 'register' | 'forgot_password' | 'otp_verification'>('login');
+  const [sellerAuthUser, setSellerAuthUser] = useState<{ email: string; businessName: string; ownerName: string; phone: string; photoUrl?: string; role?: string } | null>(null);
+  const [sellerAuthView, setSellerAuthView] = useState<
+    'login' | 'register' | 'forgot_password' | 'otp_verification' |
+    'awaiting_email_verification' | 'register_otp' | 'forgot_otp' | 'forgot_reset_password'
+  >('login');
   
   // Login form states
   const [loginEmail, setLoginEmail] = useState<string>('');
@@ -165,6 +170,7 @@ export default function App() {
 
   // Registration form states
   const [regBusinessName, setRegBusinessName] = useState<string>('');
+  const [regRole, setRegRole] = useState<'Manager/Owner' | 'Staff'>('Manager/Owner');
   const [regOwnerName, setRegOwnerName] = useState<string>('');
   const [regOwnerFirstName, setRegOwnerFirstName] = useState<string>('');
   const [regOwnerMiddleName, setRegOwnerMiddleName] = useState<string>('');
@@ -203,6 +209,12 @@ export default function App() {
   const [registerPreviewUrl, setRegisterPreviewUrl] = useState<string>('');
   const [localBypassOtp, setLocalBypassOtp] = useState<string>('');
   const [localBypassResetLink, setLocalBypassResetLink] = useState<string>('');
+  const [localBypassLink, setLocalBypassLink] = useState<string>('');
+  const [newPassword, setNewPassword] = useState<string>('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState<string>('');
+  const [newPasswordShow, setNewPasswordShow] = useState<boolean>(false);
+  const [confirmNewPasswordShow, setConfirmNewPasswordShow] = useState<boolean>(false);
+  const [countdown, setCountdown] = useState<number>(180); // 3 minutes = 180 seconds
 
   // Security dashboard features / parameters (to satisfy requirement 5)
   const [csrfToken, setCsrfToken] = useState<string>('');
@@ -293,6 +305,18 @@ export default function App() {
     const cachedLogs = localStorage.getItem('food_logs');
     const cachedTheme = localStorage.getItem('food_theme');
 
+    // Fetch registered sellers from the database backend to synchronize with client local state
+    fetch('/api/auth/sellers')
+      .then(res => res.json())
+      .then(data => {
+        if (data.success && Array.isArray(data.sellers)) {
+          localStorage.setItem('food_registered_sellers', JSON.stringify(data.sellers));
+        }
+      })
+      .catch(err => {
+        console.warn("Could not sync registered sellers list from database:", err);
+      });
+
     setMenuItems(cachedMenu ? JSON.parse(cachedMenu) : DEFAULT_MENU_ITEMS);
     setOrders(cachedOrders ? JSON.parse(cachedOrders) : []);
     setStaff(cachedStaff ? JSON.parse(cachedStaff) : DEFAULT_STAFF);
@@ -358,25 +382,121 @@ export default function App() {
     }
   }, [online]);
 
-  // Periodically poll backend sync silently in the background (every 10 seconds)
-  // to ensure customer orders appear immediately and status updates sync smoothly.
+  // Helper to normalize Main Server API Base URL
+  const getMainServerApiUrl = () => {
+    const meta = import.meta as any;
+    let url = meta.env.VITE_ADMIN_API_URL || meta.env.VITE_CUSTOMER_API_URL || 'https://visible-whomever-sprint.ngrok-free.dev/';
+    if (url && !url.endsWith('/')) {
+      url += '/';
+    }
+    return url;
+  };
+
+  // Perform a background ping to check the online status of the Main Server API connection
+  const checkMainServerStatus = async () => {
+    setCheckingMainServer(true);
+    try {
+      const url = getMainServerApiUrl();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 4000);
+      
+      const res = await fetch(`${url}api/health`, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          'Accept': 'application/json'
+        }
+      });
+      clearTimeout(timeoutId);
+      
+      if (res.ok) {
+        setMainServerOnline(true);
+      } else {
+        setMainServerOnline(false);
+      }
+    } catch (err) {
+      setMainServerOnline(false);
+    } finally {
+      setCheckingMainServer(false);
+    }
+  };
+
+  // Periodically check Main Server connection status and execute local auto-saves
   useEffect(() => {
-    if (!googleUser || !online) return;
+    // Initial check and initial local save
+    checkMainServerStatus();
+    triggerCloudSync(googleUser, true);
 
-    // Trigger immediate operations replay and standard cloud sync
-    const runInitialSync = async () => {
-      await syncQueuedOperations(googleUser, true);
-      await triggerCloudSync(googleUser, true);
+    const mainServerInterval = setInterval(checkMainServerStatus, 8000);
+    
+    // Periodically auto-save all operations to the local device MySQL database (every 8 seconds)
+    // regardless of whether we have a Google account or if the main server is online
+    const localSaveInterval = setInterval(async () => {
+      try {
+        await syncQueuedOperations(googleUser, true);
+        await triggerCloudSync(googleUser, true);
+      } catch (err) {
+        console.warn("[Local DB Sync] Background auto-save to local MySQL failed:", err);
+      }
+    }, 8000);
+
+    return () => {
+      clearInterval(mainServerInterval);
+      clearInterval(localSaveInterval);
     };
-    runInitialSync();
+  }, [googleUser]);
 
-    const intervalId = setInterval(async () => {
-      await syncQueuedOperations(googleUser, true);
-      await triggerCloudSync(googleUser, true);
-    }, 10000);
+  // Polling for email verification status during registration
+  useEffect(() => {
+    if (sellerAuthView !== 'awaiting_email_verification' || !regEmail) return;
 
-    return () => clearInterval(intervalId);
-  }, [googleUser, online]);
+    let isMounted = true;
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/auth/check-verification?email=${encodeURIComponent(regEmail)}`);
+        if (!response.ok) return;
+        const result = await response.json();
+        if (result.verified && isMounted) {
+          clearInterval(interval);
+          setLocalBypassOtp(result.localBypassOtp || '');
+          showToast("Email address successfully verified! 🎉", "success");
+          
+          playOrderChime();
+          
+          // Reset countdown timer to 3 minutes (180s)
+          setCountdown(180);
+          setOtpInputCode('');
+          setOtpError('');
+          setSellerAuthView('register_otp');
+        }
+      } catch (err) {
+        console.warn("Error polling email verification status:", err);
+      }
+    }, 2000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [sellerAuthView, regEmail]);
+
+  // Countdown timer for OTP views (3 minutes)
+  useEffect(() => {
+    if (sellerAuthView !== 'register_otp' && sellerAuthView !== 'forgot_otp') return;
+    if (countdown <= 0) return;
+
+    const timer = setInterval(() => {
+      setCountdown((prev) => prev - 1);
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [sellerAuthView, countdown]);
+
+  const formatCountdown = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
 
   // Listen to order updates to trigger live push notifications in the smartphone simulator
   useEffect(() => {
@@ -519,7 +639,8 @@ export default function App() {
       email: user.email,
       businessName: user.businessName,
       ownerName: user.ownerName,
-      phone: user.phone
+      phone: user.phone,
+      role: user.role || 'Manager/Owner'
     };
 
     setSellerAuthUser(userInfo);
@@ -616,7 +737,7 @@ export default function App() {
       return;
     }
 
-    // Phone format validation (Philippine mobile numbers are usually 11 digits starting with 09, or 10 digits starting with 9, or prefixed with +63)
+    // Phone format validation
     const phoneClean = regPhone.replace(/[\s-()+]/g, '');
     const isDigitsOnly = /^\d+$/.test(phoneClean);
     if (!isDigitsOnly || phoneClean.length < 10 || phoneClean.length > 12) {
@@ -659,37 +780,40 @@ export default function App() {
         businessName: regBusinessName,
         ownerName: combinedFullName,
         password: regPassword,
+        role: regRole,
       };
 
-      // Dispatch verification code to the target email
-      const response = await fetch('/api/auth/send-otp', {
+      // Dispatch verification link to the target email
+      const response = await fetch('/api/auth/register-init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: regEmail, type: 'register' }),
+        body: JSON.stringify({
+          email: regEmail,
+          phone: regPhone,
+          businessName: regBusinessName,
+          ownerName: combinedFullName,
+          password: regPassword,
+          role: regRole
+        }),
       });
 
       const result = await response.json();
       setRegLoading(false);
 
-      if (response.ok) {
+      if (response.ok && result.success) {
         setPendingSeller(newSeller);
-        setOtpInputCode('');
-        setOtpError('');
+        setLocalBypassLink(result.localBypassLink || '');
         setLocalBypassOtp(result.localBypassOtp || '');
-        if (result.previewUrl) {
-          setRegisterPreviewUrl(result.previewUrl);
-        } else {
-          setRegisterPreviewUrl('');
-        }
-        setSellerAuthView('register_verification');
-        writeAuditLog(`Dispatched email verification pin code to register email: ${regEmail}`);
+        setSellerAuthView('awaiting_email_verification');
+        writeAuditLog(`Initiated email verification process for: ${regEmail}`);
+        
         triggerDialog(
-          "Verification Code Transmitted 🛡️",
-          `A 6-digit security code has been transmitted to ${regEmail}. Please enter it to verify and complete your registration.`,
+          "Verification Link Dispatched 📧",
+          `A secure verification link has been transmitted to ${regEmail}. Please open the link in your email to verify your address and automatically proceed to OTP verification.`,
           "info"
         );
       } else {
-        setRegError(result.error || 'Failed to dispatch verification email. Please check configuration.');
+        setRegError(result.error || 'Failed to dispatch verification email. Please check your config.');
       }
     } catch (err: any) {
       setRegLoading(false);
@@ -712,11 +836,16 @@ export default function App() {
       return;
     }
 
+    if (countdown <= 0) {
+      setOtpError('Verification countdown expired. Please restart the registration process.');
+      return;
+    }
+
     setOtpLoading(true);
 
     try {
-      // Validate OTP code via Express backend email engine
-      const response = await fetch('/api/auth/verify-otp', {
+      // Validate OTP code via Express backend
+      const response = await fetch('/api/auth/register-verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: pendingSeller.email, otp: otpInputCode }),
@@ -739,12 +868,12 @@ export default function App() {
         setSellerAuthView('login');
 
         triggerDialog(
-          "Email Verified & Registered! 🎉",
-          "Your email has been successfully verified, and your Seller Partner account is active. You can now log in.",
+          "Registration Successful! 🎉",
+          "Your Seller Partner account has been successfully verified, registered, and activated. You can now sign in.",
           "success"
         );
       } else {
-        setOtpError(result.error || 'Incorrect code. Please check your email and try again.');
+        setOtpError(result.error || 'Incorrect OTP code. Please check your email and try again.');
       }
     } catch (err: any) {
       setOtpLoading(false);
@@ -765,7 +894,7 @@ export default function App() {
     setForgotLoading(true);
 
     try {
-      const response = await fetch('/api/auth/forgot-password', {
+      const response = await fetch('/api/auth/forgot-password-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: forgotEmail.trim() }),
@@ -775,17 +904,153 @@ export default function App() {
       setForgotLoading(false);
 
       if (response.ok && result.success) {
-        setForgotPreviewUrl(result.previewUrl || '');
-        setLocalBypassResetLink(result.localBypassResetLink || '');
-        setForgotSubmitted(true);
-        writeAuditLog(`Password reset email successfully sent to: ${forgotEmail}`);
+        setLocalBypassOtp(result.localBypassOtp || '');
+        setCountdown(180); // 3 minutes
+        setOtpInputCode('');
+        setOtpError('');
+        setSellerAuthView('forgot_otp');
+        writeAuditLog(`Password reset OTP successfully sent to: ${forgotEmail}`);
       } else {
-        setForgotError(result.error || 'Failed to dispatch password reset email. Please ensure it is a valid email.');
+        setForgotError(result.error || 'Failed to dispatch password recovery OTP. Please ensure it is a valid email.');
       }
     } catch (err: any) {
       setForgotLoading(false);
-      setForgotError('Network error while requesting password reset. Please check connection.');
+      setForgotError('Network error while requesting recovery. Please check connection.');
       console.error('Forgot password error:', err);
+    }
+  };
+
+  const handleForgotOtpVerification = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setOtpError('');
+
+    if (!otpInputCode.trim()) {
+      setOtpError('Please enter the 6-digit OTP code.');
+      return;
+    }
+
+    if (countdown <= 0) {
+      setOtpError('The OTP countdown has expired. Please click "Resend OTP" to obtain a new code.');
+      return;
+    }
+
+    setOtpLoading(true);
+
+    try {
+      const response = await fetch('/api/auth/forgot-verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: forgotEmail.trim(), otp: otpInputCode }),
+      });
+
+      const result = await response.json();
+      setOtpLoading(false);
+
+      if (response.ok && result.success) {
+        setNewPassword('');
+        setConfirmNewPassword('');
+        setSellerAuthView('forgot_reset_password');
+      } else {
+        setOtpError(result.error || 'Incorrect OTP code. Please try again.');
+      }
+    } catch (err: any) {
+      setOtpLoading(false);
+      setOtpError('Network error during verification. Please check connection.');
+      console.error(err);
+    }
+  };
+
+  const handleResendForgotOtp = async () => {
+    setOtpError('');
+    setOtpLoading(true);
+
+    try {
+      const response = await fetch('/api/auth/forgot-password-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: forgotEmail.trim() }),
+      });
+
+      const result = await response.json();
+      setOtpLoading(false);
+
+      if (response.ok && result.success) {
+        setLocalBypassOtp(result.localBypassOtp || '');
+        setCountdown(180); // Reset to 3 minutes
+        setOtpInputCode('');
+        showToast("A new 6-digit OTP has been sent to your email! 🛡️", "info");
+        writeAuditLog(`Resent password reset OTP to: ${forgotEmail}`);
+      } else {
+        setOtpError(result.error || 'Failed to resend OTP code.');
+      }
+    } catch (err: any) {
+      setOtpLoading(false);
+      setOtpError('Network error while resending OTP.');
+    }
+  };
+
+  const handleSaveResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setOtpError('');
+
+    if (!newPassword.trim() || !confirmNewPassword.trim()) {
+      setOtpError('Please fill in both password fields.');
+      return;
+    }
+
+    if (newPassword.length < 6) {
+      setOtpError('Password must be at least 6 characters long.');
+      return;
+    }
+
+    if (newPassword !== confirmNewPassword) {
+      setOtpError('Passwords do not match.');
+      return;
+    }
+
+    setOtpLoading(true);
+
+    try {
+      const response = await fetch('/api/auth/reset-password-save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: forgotEmail.trim(), password: newPassword }),
+      });
+
+      const result = await response.json();
+      setOtpLoading(false);
+
+      if (response.ok && result.success) {
+        // Now update the seller password in localStorage food_registered_sellers list!
+        const registered = getRegisteredSellers();
+        const userIndex = registered.findIndex((u: any) => u.email.toLowerCase() === forgotEmail.toLowerCase());
+        
+        if (userIndex !== -1) {
+          registered[userIndex].password = newPassword;
+          localStorage.setItem('food_registered_sellers', JSON.stringify(registered));
+          writeAuditLog(`Password reset successfully saved for Seller partner: ${forgotEmail}`);
+          
+          setLoginEmail(forgotEmail);
+          setForgotEmail('');
+          setNewPassword('');
+          setConfirmNewPassword('');
+          setSellerAuthView('login');
+
+          triggerDialog(
+            "Password Reset Completed! 🔐",
+            "Your account password has been updated. You can now use your new credentials to log in.",
+            "success"
+          );
+        } else {
+          setOtpError("Failed to update password. Seller profile not found.");
+        }
+      } else {
+        setOtpError(result.error || 'Failed to save new password. Please try again.');
+      }
+    } catch (err: any) {
+      setOtpLoading(false);
+      setOtpError('Network error during password reset. Please check connection.');
+      console.error(err);
     }
   };
 
@@ -813,7 +1078,7 @@ export default function App() {
       }
 
       // Backdoor bypass option for offline/testing convenience
-      if (otpInputCode === '123456' || (localBypassOtp && otpInputCode === localBypassOtp)) {
+      if (localBypassOtp && otpInputCode === localBypassOtp) {
         setOtpLoading(false);
         setShowOtpNotification(false);
         completeLoginSession(user);
@@ -875,6 +1140,21 @@ export default function App() {
           setSellerAuthUser(updatedUser);
           setCookie('food_persistent_session', JSON.stringify(updatedUser), 30);
           sessionStorage.setItem('cookie_food_session_cookie', JSON.stringify(updatedUser));
+
+          // Sync profile picture to database
+          fetch('/api/auth/update-profile-picture', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: sellerAuthUser.email, photoUrl: base64String })
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.success) {
+              console.log("[Database] Seller profile picture updated in database.");
+            }
+          })
+          .catch(err => console.error("Could not sync profile picture to database:", err));
+
           writeAuditLog("Owner uploaded a custom profile picture");
           showToast("Profile image updated successfully!", "success");
         }
@@ -993,22 +1273,16 @@ export default function App() {
     }
   };
 
-  // Cloud Synchronizer (Bi-directional comparison with Conflict Resolution)
+  // Local Database Synchronizer (Bi-directional comparison with local device MySQL database)
   const triggerCloudSync = async (usrToUse: FirebaseUser | null = googleUser, silent: boolean = false) => {
     const userToAuth = usrToUse || auth.currentUser;
-    if (!navigator.onLine) {
-      if (!silent) {
-        showToast("No internet connection. Your changes are saved offline!", "warning");
-      }
-      return;
-    }
 
     if (!silent) setSyncStatus('syncing');
     try {
       let response;
       if (userToAuth) {
         const token = await userToAuth.getIdToken();
-        // Prepare local copies to push to cloud
+        // Prepare local copies to push to local device MySQL
         response = await fetch('/api/sync', {
           method: 'POST',
           headers: {
@@ -1023,7 +1297,7 @@ export default function App() {
           })
         });
       } else {
-        // Local database sync for local/PIN-based/anonymous sessions with MySQL Workbench
+        // Local database sync for local/PIN-based/anonymous sessions with local device MySQL database
         response = await fetch('/api/public/sync', {
           method: 'POST',
           headers: {
@@ -1039,7 +1313,7 @@ export default function App() {
       }
 
       if (!response.ok) {
-        throw new Error("Server responded with failure");
+        throw new Error("Local server responded with failure");
       }
 
       const backendData = await response.json();
@@ -1048,7 +1322,7 @@ export default function App() {
         const existingOrderIds = new Set(currentLocalOrders.map((o: any) => o.id));
         const hasNewOrders = backendData.orders.some((o: any) => !existingOrderIds.has(o.id));
 
-        // Overwrite local tables with backend consolidated tables (postconflict resolution)
+        // Overwrite local tables with backend consolidated tables
         saveLocalMenu(backendData.menuItems);
         saveLocalStaff(backendData.staff);
         saveLocalOrders(backendData.orders);
@@ -1060,18 +1334,125 @@ export default function App() {
 
         if (!silent) {
           setSyncStatus('success');
-          setLastSyncText(`Synced at: ${new Date().toLocaleTimeString()}`);
+          setLastSyncText(`Saved to Local MySQL at: ${new Date().toLocaleTimeString()}`);
           setTimeout(() => setSyncStatus('idle'), 4000);
         } else {
-          setLastSyncText(`Auto-synced: ${new Date().toLocaleTimeString()}`);
+          setLastSyncText(`Auto-saved to MySQL: ${new Date().toLocaleTimeString()}`);
         }
       }
     } catch (e: any) {
-      console.error("Sync process failed:", e);
+      console.warn("Local MySQL auto-save/sync process issue:", e);
       if (!silent) {
         setSyncStatus('error');
         setTimeout(() => setSyncStatus('idle'), 4000);
       }
+    }
+  };
+
+  // Main Database Cloud Synchronizer (Triggered via the Sync button when main server API is online)
+  const triggerMainDatabaseSync = async () => {
+    if (!mainServerOnline) {
+      showToast("Main server is offline. Synchronization is disabled.", "warning");
+      return;
+    }
+
+    setSyncStatus('syncing');
+    showToast("Starting synchronization with Main Online Database...", "info");
+
+    try {
+      // Step A: First sync/save everything to the local device MySQL database to get latest consolidated local dataset
+      let localResponse = await fetch('/api/public/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          clientMenuItems: menuItems,
+          clientStaff: staff,
+          clientOrders: orders,
+          clientAuditLogs: auditLogs,
+        })
+      });
+
+      if (!localResponse.ok) {
+        throw new Error("Failed to secure local MySQL database state before cloud sync");
+      }
+
+      const localDatabaseData = await localResponse.json();
+
+      // Step B: Post the local device MySQL database data to the Main Server API for synchronization
+      const mainServerUrl = getMainServerApiUrl();
+      const token = googleUser ? await googleUser.getIdToken() : null;
+      
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
+      const mainSyncUrl = token ? `${mainServerUrl}api/sync` : `${mainServerUrl}api/public/sync`;
+
+      console.log(`[Main Sync] Dispatching local data to main server: ${mainSyncUrl}`);
+      const mainResponse = await fetch(mainSyncUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          clientMenuItems: localDatabaseData.menuItems,
+          clientStaff: localDatabaseData.staff,
+          clientOrders: localDatabaseData.orders,
+          clientAuditLogs: localDatabaseData.auditLogs,
+        })
+      });
+
+      if (!mainResponse.ok) {
+        throw new Error(`Main server API responded with error status: ${mainResponse.status}`);
+      }
+
+      const mainDatabaseData = await mainResponse.json();
+      
+      if (mainDatabaseData.success) {
+        // Step C: Write the consolidated online data back to our local device MySQL database to keep them identical
+        const updateLocalResponse = await fetch('/api/public/sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            clientMenuItems: mainDatabaseData.menuItems,
+            clientStaff: mainDatabaseData.staff,
+            clientOrders: mainDatabaseData.orders,
+            clientAuditLogs: mainDatabaseData.auditLogs,
+          })
+        });
+
+        if (!updateLocalResponse.ok) {
+          throw new Error("Failed to write consolidated cloud data to local device MySQL database");
+        }
+
+        const finalizedData = await updateLocalResponse.json();
+
+        // Step D: Update React States and client storage with finalized consolidated dataset
+        saveLocalMenu(finalizedData.menuItems);
+        saveLocalStaff(finalizedData.staff);
+        saveLocalOrders(finalizedData.orders);
+        saveLocalLogs(finalizedData.auditLogs);
+
+        playOrderChime();
+        setSyncStatus('success');
+        setLastSyncText(`Synced with Main DB at: ${new Date().toLocaleTimeString()}`);
+        showToast("Success! Local MySQL database is fully synced with Main Database! 🎉", "success");
+        writeAuditLog("Manually triggered sync with Main Database successfully.");
+        
+        setTimeout(() => setSyncStatus('idle'), 4000);
+      } else {
+        throw new Error("Main server API sync responded but failed to process successfully");
+      }
+    } catch (err: any) {
+      console.error("[Main Sync Error] Failed to synchronize with main server API:", err);
+      setSyncStatus('error');
+      showToast(`Sync Failed: ${err.message || 'Connection lost'}`, "error");
+      setTimeout(() => setSyncStatus('idle'), 4000);
     }
   };
 
@@ -2342,7 +2723,7 @@ export default function App() {
                 <span className="font-bold block uppercase tracking-wider text-amber-300">🛡️ Real-Time 2FA Verification Alert</span>
                 <p className="text-neutral-100">A secure 6-digit OTP code has been dispatched to your email address.</p>
                 
-                {otpPreviewUrl ? (
+                {otpPreviewUrl && (
                   <div className="pt-2">
                     <a 
                       href={otpPreviewUrl} 
@@ -2353,10 +2734,6 @@ export default function App() {
                       📧 Open Real Received Email Inbox
                     </a>
                     <span className="block text-[9px] text-neutral-300 mt-1">Click above to view your email and read the verification code.</span>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-2 pt-1">
-                    <span className="text-[10px] text-neutral-300">Use standard backdoor code <code className="bg-black/30 px-1 rounded text-white font-mono font-bold">123456</code> to bypass.</span>
                   </div>
                 )}
               </div>
@@ -2558,9 +2935,9 @@ export default function App() {
                     />
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="grid grid-cols-3 gap-3">
                     <div className="space-y-1">
-                      <label className="text-xs font-semibold text-neutral-400 block">First Name *</label>
+                      <label className="text-xs font-semibold text-neutral-400 h-8 flex items-end pb-1">First Name *</label>
                       <input
                         type="text"
                         placeholder="e.g. John"
@@ -2575,7 +2952,7 @@ export default function App() {
                     </div>
 
                     <div className="space-y-1">
-                      <label className="text-xs font-semibold text-neutral-400 block">Middle Name <span className="text-[10px] text-neutral-500 font-normal font-sans">(Optional)</span></label>
+                      <label className="text-xs font-semibold text-neutral-400 h-8 flex items-end pb-1">Middle Name</label>
                       <input
                         type="text"
                         placeholder="e.g. Smith"
@@ -2590,7 +2967,7 @@ export default function App() {
                     </div>
 
                     <div className="space-y-1">
-                      <label className="text-xs font-semibold text-neutral-400 block">Surname *</label>
+                      <label className="text-xs font-semibold text-neutral-400 h-8 flex items-end pb-1">Surname *</label>
                       <input
                         type="text"
                         placeholder="e.g. Doe"
@@ -2618,6 +2995,22 @@ export default function App() {
                           : 'bg-neutral-50 border-neutral-200 focus:border-indigo-500 text-neutral-900'
                       }`}
                     />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-neutral-400 block">User Role</label>
+                    <select
+                      value={regRole}
+                      onChange={(e) => setRegRole(e.target.value as 'Manager/Owner' | 'Staff')}
+                      className={`w-full px-4 py-2.5 rounded-xl text-sm border font-sans transition-colors focus:outline-none ${
+                        theme === 'dark' 
+                          ? 'bg-neutral-950 border-neutral-800 focus:border-indigo-500 text-white [&>option]:bg-neutral-950' 
+                          : 'bg-neutral-50 border-neutral-200 focus:border-indigo-500 text-neutral-900 [&>option]:bg-white'
+                      }`}
+                    >
+                      <option value="Manager/Owner">Manager/Owner</option>
+                      <option value="Staff">Staff</option>
+                    </select>
                   </div>
 
                   <div className="space-y-1">
@@ -2772,7 +3165,7 @@ export default function App() {
               <form onSubmit={handleSellerForgotPassword} className="space-y-5">
                 <div className="space-y-1.5 text-center">
                   <h2 className="text-2xl font-bold tracking-tight">Reset Password</h2>
-                  <p className="text-xs text-neutral-400">Enter your registered email and we will send you a recovery link.</p>
+                  <p className="text-xs text-neutral-400">Enter your registered email address and we will send an OTP code to verify your identity.</p>
                 </div>
 
                 {forgotError && (
@@ -2782,103 +3175,51 @@ export default function App() {
                   </div>
                 )}
 
-                {forgotSubmitted ? (
-                  <div className="space-y-4 text-center">
-                    <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl space-y-1.5">
-                      <CheckCircle2 className="mx-auto text-emerald-500 animate-bounce" size={28} />
-                      <h4 className="font-bold text-sm text-emerald-400">Recovery Link Transmitted!</h4>
-                      <p className="text-[11px] text-neutral-400">
-                        We have dispatched a secure password reset link to <code className="text-white bg-black/30 px-1 rounded font-mono">{forgotEmail}</code>.
-                      </p>
-                      {forgotPreviewUrl && (
-                        <div className="pt-2 border-t border-neutral-800/50 mt-2">
-                          <a 
-                            href={forgotPreviewUrl} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 bg-amber-400 hover:bg-amber-300 text-neutral-900 px-3 py-1.5 rounded-lg font-bold text-[11px] decoration-transparent shadow-sm"
-                          >
-                            📧 Open Password Reset Email
-                          </a>
-                        </div>
-                      )}
-                      {localBypassResetLink && (
-                        <div className="pt-2 border-t border-neutral-800/50 mt-2 space-y-1.5">
-                          <p className="text-[10px] text-neutral-400">
-                            ⚠️ Mail service is unconfigured/blocked. Use this recovery link directly to set your new password:
-                          </p>
-                          <a 
-                            href={localBypassResetLink} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1.5 bg-emerald-500 hover:bg-emerald-400 text-neutral-950 px-3.5 py-1.5 rounded-xl font-bold text-[11px] decoration-transparent shadow-sm hover:scale-[1.02] transition-transform"
-                          >
-                            🔑 Open Local Bypass Reset Form
-                          </a>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setForgotSubmitted(false);
-                        setForgotEmail('');
-                        setSellerAuthView('login');
-                      }}
-                      className="w-full py-2.5 bg-neutral-800 hover:bg-neutral-750 text-white text-xs font-bold rounded-xl border border-neutral-700 transition cursor-pointer"
-                    >
-                      Back to Login
-                    </button>
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-neutral-400 block">Registered Email Address</label>
+                  <div className="relative">
+                    <Mail className="absolute left-3.5 top-1/2 -translate-y-1/2 text-neutral-500" size={16} />
+                    <input
+                      type="text"
+                      placeholder="e.g. partner@portal.com"
+                      value={forgotEmail}
+                      onChange={(e) => setForgotEmail(e.target.value)}
+                      className={`w-full pl-10 pr-4 py-3 rounded-xl text-sm border font-sans transition-colors ${
+                        theme === 'dark' 
+                          ? 'bg-neutral-950 border-neutral-800 focus:border-indigo-500 text-white' 
+                          : 'bg-neutral-50 border-neutral-200 focus:border-indigo-500 text-neutral-900'
+                      }`}
+                    />
                   </div>
-                ) : (
-                  <>
-                    <div className="space-y-1">
-                      <label className="text-xs font-semibold text-neutral-400 block">Registered Email Address</label>
-                      <div className="relative">
-                        <Mail className="absolute left-3.5 top-1/2 -translate-y-1/2 text-neutral-500" size={16} />
-                        <input
-                          type="text"
-                          placeholder="e.g. partner@portal.com"
-                          value={forgotEmail}
-                          onChange={(e) => setForgotEmail(e.target.value)}
-                          className={`w-full pl-10 pr-4 py-3 rounded-xl text-sm border font-sans transition-colors ${
-                            theme === 'dark' 
-                              ? 'bg-neutral-950 border-neutral-800 focus:border-indigo-500 text-white' 
-                              : 'bg-neutral-50 border-neutral-200 focus:border-indigo-500 text-neutral-900'
-                          }`}
-                        />
-                      </div>
-                    </div>
+                </div>
 
-                    <div className="space-y-3 pt-2">
-                      <button
-                        type="submit"
-                        disabled={forgotLoading}
-                        className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 cursor-pointer active:scale-98"
-                      >
-                        {forgotLoading ? (
-                          <>
-                            <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                            <span>Verifying Credentials...</span>
-                          </>
-                        ) : (
-                          <>
-                            <span>Transmit Recovery Link</span>
-                            <ChevronRight size={16} />
-                          </>
-                        )}
-                      </button>
+                <div className="space-y-3 pt-2">
+                  <button
+                    type="submit"
+                    disabled={forgotLoading}
+                    className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 cursor-pointer active:scale-98 shadow-lg shadow-indigo-600/10"
+                  >
+                    {forgotLoading ? (
+                      <>
+                        <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                        <span>Sending OTP Code...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>Send OTP Code</span>
+                        <ChevronRight size={16} />
+                      </>
+                    )}
+                  </button>
 
-                      <button
-                        type="button"
-                        onClick={() => setSellerAuthView('login')}
-                        className="w-full py-2.5 bg-transparent hover:bg-neutral-800/20 text-neutral-400 font-bold text-xs rounded-xl transition cursor-pointer"
-                      >
-                        Cancel & Return
-                      </button>
-                    </div>
-                  </>
-                )}
+                  <button
+                    type="button"
+                    onClick={() => setSellerAuthView('login')}
+                    className="w-full py-2.5 bg-transparent hover:bg-neutral-800/20 text-neutral-400 font-bold text-xs rounded-xl transition cursor-pointer"
+                  >
+                    Cancel & Return
+                  </button>
+                </div>
               </form>
             )}
 
@@ -2964,16 +3305,69 @@ export default function App() {
               </form>
             )}
 
-            {/* VIEW 5: REGISTER VERIFICATION */}
-            {sellerAuthView === 'register_verification' && (
+            {/* VIEW 5: AWAITING EMAIL VERIFICATION */}
+            {sellerAuthView === 'awaiting_email_verification' && (
+              <div className="space-y-6 text-center">
+                <div className="mx-auto w-16 h-16 bg-indigo-500/10 text-indigo-400 rounded-full flex items-center justify-center animate-bounce">
+                  <Mail size={28} />
+                </div>
+                <div className="space-y-1.5">
+                  <h2 className="text-xl font-bold tracking-tight">Awaiting Email Verification</h2>
+                  <p className="text-xs text-neutral-400 leading-normal">
+                    We have sent a verification link to <code className="text-white bg-black/30 px-1 rounded font-mono">{regEmail}</code>. Please open your email inbox and click on the verification link to proceed.
+                  </p>
+                </div>
+
+                <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-2xl flex flex-col items-center justify-center space-y-2">
+                  <div className="flex items-center gap-2">
+                    <div className="h-3 w-3 bg-indigo-500 rounded-full animate-ping"></div>
+                    <span className="text-xs font-semibold text-neutral-300">Listening for link activation...</span>
+                  </div>
+                  <p className="text-[10px] text-neutral-500">
+                    The screen will automatically transition to the OTP verification screen once verified.
+                  </p>
+                </div>
+
+                {localBypassLink && (
+                  <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-center space-y-1.5">
+                    <h4 className="font-bold text-xs text-emerald-400">🛡️ Dev/Test Bypass Mode</h4>
+                    <p className="text-[10px] text-neutral-400">
+                      Since mail services might be restricted inside the sandbox, click below to verify directly:
+                    </p>
+                    <a 
+                      href={localBypassLink} 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 bg-emerald-500 hover:bg-emerald-400 text-neutral-950 px-3.5 py-1.5 rounded-xl font-bold text-[11px] decoration-transparent shadow-sm hover:scale-[1.02] transition-all"
+                    >
+                      🔗 Click to Simulate Email Verification
+                    </a>
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingSeller(null);
+                    setSellerAuthView('register');
+                  }}
+                  className="w-full py-2.5 bg-transparent hover:bg-neutral-800/20 text-neutral-400 font-bold text-xs rounded-xl transition cursor-pointer"
+                >
+                  Cancel & Return to Registration
+                </button>
+              </div>
+            )}
+
+            {/* VIEW 6: REGISTER OTP VERIFICATION */}
+            {sellerAuthView === 'register_otp' && (
               <form onSubmit={handleRegisterOtpVerification} className="space-y-5">
                 <div className="space-y-1.5 text-center">
-                  <div className="mx-auto w-12 h-12 bg-indigo-500/10 text-indigo-400 rounded-full flex items-center justify-center animate-bounce">
-                    <Mail size={24} />
+                  <div className="mx-auto w-16 h-16 bg-emerald-500/10 text-emerald-400 rounded-full flex items-center justify-center">
+                    <CheckCircle2 size={28} className="animate-pulse" />
                   </div>
-                  <h2 className="text-xl font-bold tracking-tight">Verify Your Email Address</h2>
+                  <h2 className="text-xl font-bold tracking-tight">Email Verified Successfully!</h2>
                   <p className="text-xs text-neutral-400 leading-normal">
-                    We have dispatched a 6-digit registration PIN to <code className="text-white bg-black/30 px-1 rounded font-mono">{pendingSeller?.email}</code>. Please enter the security PIN below to complete verification and register your account.
+                    Please enter the 6-digit OTP security PIN sent to your email <code className="text-white bg-black/30 px-1 rounded font-mono">{regEmail}</code> to finalize your registration.
                   </p>
                 </div>
 
@@ -2986,7 +3380,7 @@ export default function App() {
 
                 <div className="space-y-4">
                   <div className="space-y-1">
-                    <label className="text-xs font-semibold text-neutral-400 block text-center">6-Digit Verification PIN</label>
+                    <label className="text-xs font-semibold text-neutral-400 block text-center">6-Digit OTP Security Code</label>
                     <input
                       type="text"
                       maxLength={6}
@@ -2996,34 +3390,19 @@ export default function App() {
                       className="w-full py-3.5 rounded-2xl text-lg font-mono tracking-[0.5em] text-center border font-sans transition-colors bg-neutral-950 border-neutral-800 focus:border-indigo-500 text-white max-w-[200px] mx-auto block"
                     />
                   </div>
-                </div>
 
-                {registerPreviewUrl && (
-                  <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl text-center space-y-1.5">
-                    <h4 className="font-bold text-xs text-amber-400">📧 Ethereal Test Email Sandbox Active</h4>
-                    <p className="text-[10px] text-neutral-400">
-                      Since real SMTP/Gmail is not configured yet, you can view the sent registration OTP code directly:
-                    </p>
-                    <a 
-                      href={registerPreviewUrl} 
-                      target="_blank" 
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 bg-amber-400 hover:bg-amber-300 text-neutral-900 px-3 py-1.5 rounded-lg font-bold text-[10px] decoration-transparent shadow-sm"
-                    >
-                      Open Ethereal Sandbox Email
-                    </a>
+                  <div className="text-center">
+                    <span className="text-xs text-neutral-400">Code expires in: </span>
+                    <span className={`text-xs font-bold font-mono ${countdown < 30 ? 'text-rose-500 animate-pulse' : 'text-indigo-400'}`}>
+                      {formatCountdown(countdown)}
+                    </span>
                   </div>
-                )}
+                </div>
 
                 {localBypassOtp && (
                   <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-center space-y-1.5">
-                    <h4 className="font-bold text-xs text-emerald-400 flex items-center justify-center gap-1.5">
-                      <span>🛡️ Secure Delivery Bypass Active</span>
-                    </h4>
-                    <p className="text-[10px] text-neutral-400 leading-normal">
-                      Since mail service is unconfigured or blocked, we've bypassed email delivery. Enter this 6-digit security PIN to complete verification:
-                    </p>
-                    <div className="text-xl font-mono font-bold tracking-widest text-emerald-300 bg-neutral-950/60 py-2 rounded-xl border border-emerald-500/10 max-w-[150px] mx-auto select-all">
+                    <h4 className="font-bold text-xs text-emerald-400">🛡️ Bypass Code</h4>
+                    <div className="text-xl font-mono font-bold tracking-widest text-emerald-300 bg-neutral-950/60 py-1.5 rounded-xl border border-emerald-500/10 max-w-[140px] mx-auto select-all">
                       {localBypassOtp}
                     </div>
                   </div>
@@ -3032,13 +3411,13 @@ export default function App() {
                 <div className="space-y-3 pt-2">
                   <button
                     type="submit"
-                    disabled={otpLoading}
-                    className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 cursor-pointer active:scale-98"
+                    disabled={otpLoading || countdown <= 0}
+                    className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 cursor-pointer active:scale-98 shadow-lg shadow-indigo-600/10"
                   >
                     {otpLoading ? (
                       <>
                         <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                        <span>Verifying Registration Code...</span>
+                        <span>Verifying OTP...</span>
                       </>
                     ) : (
                       <>
@@ -3059,6 +3438,203 @@ export default function App() {
                     className="w-full py-2.5 bg-transparent hover:bg-neutral-800/20 text-neutral-400 font-bold text-xs rounded-xl transition cursor-pointer"
                   >
                     Back to Register Form
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* VIEW 7: FORGOT PASSWORD OTP VERIFICATION */}
+            {sellerAuthView === 'forgot_otp' && (
+              <form onSubmit={handleForgotOtpVerification} className="space-y-5">
+                <div className="space-y-1.5 text-center">
+                  <div className="mx-auto w-16 h-16 bg-amber-500/10 text-amber-400 rounded-full flex items-center justify-center">
+                    <Shield size={28} className="animate-pulse" />
+                  </div>
+                  <h2 className="text-xl font-bold tracking-tight">Enter Reset Password OTP</h2>
+                  <p className="text-xs text-neutral-400 leading-normal">
+                    We've sent a 6-digit OTP code to <code className="text-white bg-black/30 px-1 rounded font-mono">{forgotEmail}</code>. Enter the security code below to change your password.
+                  </p>
+                </div>
+
+                {otpError && (
+                  <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-center gap-2.5 text-rose-500 text-xs font-semibold">
+                    <AlertTriangle size={15} className="shrink-0" />
+                    <span>{otpError}</span>
+                  </div>
+                )}
+
+                <div className="space-y-4">
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-neutral-400 block text-center">6-Digit OTP Code</label>
+                    <input
+                      type="text"
+                      maxLength={6}
+                      placeholder="e.g. 123456"
+                      value={otpInputCode}
+                      onChange={(e) => setOtpInputCode(e.target.value.replace(/\D/g, ''))}
+                      className="w-full py-3.5 rounded-2xl text-lg font-mono tracking-[0.5em] text-center border font-sans transition-colors bg-neutral-950 border-neutral-800 focus:border-indigo-500 text-white max-w-[200px] mx-auto block"
+                    />
+                  </div>
+
+                  <div className="text-center space-y-1.5">
+                    <div className="text-xs text-neutral-400">
+                      Code expires in: <span className={`font-bold font-mono ${countdown < 30 ? 'text-rose-500 animate-pulse' : 'text-amber-400'}`}>{formatCountdown(countdown)}</span>
+                    </div>
+                    <div>
+                      <button
+                        type="button"
+                        disabled={countdown > 0 || otpLoading}
+                        onClick={handleResendForgotOtp}
+                        className="text-xs font-bold text-indigo-400 hover:text-indigo-300 disabled:opacity-40 transition-opacity cursor-pointer underline bg-transparent border-none"
+                      >
+                        Resend OTP Code {countdown > 0 ? `(wait ${countdown}s)` : ''}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {localBypassOtp && (
+                  <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-center space-y-1.5">
+                    <h4 className="font-bold text-xs text-emerald-400">🛡️ Bypass Code</h4>
+                    <div className="text-xl font-mono font-bold tracking-widest text-emerald-300 bg-neutral-950/60 py-1.5 rounded-xl border border-emerald-500/10 max-w-[140px] mx-auto select-all">
+                      {localBypassOtp}
+                    </div>
+                  </div>
+                )}
+
+                <div className="space-y-3 pt-2">
+                  <button
+                    type="submit"
+                    disabled={otpLoading || countdown <= 0}
+                    className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 cursor-pointer active:scale-98"
+                  >
+                    {otpLoading ? (
+                      <>
+                        <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                        <span>Verifying OTP...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>Verify Code & Reset Password</span>
+                        <ChevronRight size={16} />
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOtpInputCode('');
+                      setOtpError('');
+                      setSellerAuthView('forgot_password');
+                    }}
+                    className="w-full py-2.5 bg-transparent hover:bg-neutral-800/20 text-neutral-400 font-bold text-xs rounded-xl transition cursor-pointer"
+                  >
+                    Back to Recovery Page
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* VIEW 8: CREATE NEW PASSWORD */}
+            {sellerAuthView === 'forgot_reset_password' && (
+              <form onSubmit={handleSaveResetPassword} className="space-y-5">
+                <div className="space-y-1.5 text-center">
+                  <div className="mx-auto w-16 h-16 bg-indigo-500/10 text-indigo-400 rounded-full flex items-center justify-center">
+                    <KeyRound size={28} />
+                  </div>
+                  <h2 className="text-xl font-bold tracking-tight">Create New Password</h2>
+                  <p className="text-xs text-neutral-400 leading-normal">
+                    Your code was successfully verified. Please enter and confirm your new secure password.
+                  </p>
+                </div>
+
+                {otpError && (
+                  <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-center gap-2.5 text-rose-500 text-xs font-semibold">
+                    <AlertTriangle size={15} className="shrink-0" />
+                    <span>{otpError}</span>
+                  </div>
+                )}
+
+                <div className="space-y-4">
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-neutral-400 block">New Password</label>
+                    <div className="relative flex items-center">
+                      <input
+                        type={newPasswordShow ? "text" : "password"}
+                        placeholder="Min 6 characters"
+                        value={newPassword}
+                        onChange={(e) => setNewPassword(e.target.value)}
+                        className={`w-full pl-4 pr-10 py-3 rounded-xl text-sm border font-sans transition-colors ${
+                          theme === 'dark' 
+                            ? 'bg-neutral-950 border-neutral-800 focus:border-indigo-500 text-white' 
+                            : 'bg-neutral-50 border-neutral-200 focus:border-indigo-500 text-neutral-900'
+                        }`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setNewPasswordShow(!newPasswordShow)}
+                        className="absolute right-3 text-neutral-500 hover:text-neutral-300 focus:outline-none transition p-1 rounded-lg cursor-pointer"
+                      >
+                        {newPasswordShow ? <EyeOff size={15} /> : <Eye size={15} />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-neutral-400 block">Confirm New Password</label>
+                    <div className="relative flex items-center">
+                      <input
+                        type={confirmNewPasswordShow ? "text" : "password"}
+                        placeholder="••••••••"
+                        value={confirmNewPassword}
+                        onChange={(e) => setConfirmNewPassword(e.target.value)}
+                        className={`w-full pl-4 pr-10 py-3 rounded-xl text-sm border font-sans transition-colors ${
+                          theme === 'dark' 
+                            ? 'bg-neutral-950 border-neutral-800 focus:border-indigo-500 text-white' 
+                            : 'bg-neutral-50 border-neutral-200 focus:border-indigo-500 text-neutral-900'
+                        }`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setConfirmNewPasswordShow(!confirmNewPasswordShow)}
+                        className="absolute right-3 text-neutral-500 hover:text-neutral-300 focus:outline-none transition p-1 rounded-lg cursor-pointer"
+                      >
+                        {confirmNewPasswordShow ? <EyeOff size={15} /> : <Eye size={15} />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-3 pt-2">
+                  <button
+                    type="submit"
+                    disabled={otpLoading}
+                    className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 cursor-pointer active:scale-98 shadow-lg shadow-indigo-600/10"
+                  >
+                    {otpLoading ? (
+                      <>
+                        <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                        <span>Saving Password...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>Reset Password</span>
+                        <ChevronRight size={16} />
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNewPassword('');
+                      setConfirmNewPassword('');
+                      setSellerAuthView('login');
+                    }}
+                    className="w-full py-2.5 bg-transparent hover:bg-neutral-800/20 text-neutral-400 font-bold text-xs rounded-xl transition cursor-pointer"
+                  >
+                    Cancel & Return to Login
                   </button>
                 </div>
               </form>
@@ -3101,36 +3677,45 @@ export default function App() {
         {/* Sync Controls & Firebase Auth */}
         <div className="flex flex-wrap items-center gap-3">
           
-          {/* Connectivity Status Pill */}
-          <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ${
-            online 
-              ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20' 
-              : 'bg-rose-500/10 text-rose-500 border-rose-500/20'
+          {/* Local MySQL Connection status */}
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border bg-emerald-500/10 text-emerald-500 border-emerald-500/20 font-mono">
+            <span className="h-2 w-2 rounded-full bg-emerald-500"></span>
+            <span>LOCAL MySQL: READY</span>
+          </div>
+
+          {/* Main Server Connection Status Pill */}
+          <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors font-mono ${
+            mainServerOnline 
+              ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20' 
+              : 'bg-rose-500/10 text-rose-500 border-rose-500/20 animate-pulse'
           }`}>
-            {online ? <Wifi size={14} /> : <WifiOff size={14} />}
-            {online ? 'ONLINE' : 'OFFLINE'}
+            {mainServerOnline ? <Wifi size={14} className="text-indigo-400" /> : <WifiOff size={14} className="text-rose-500" />}
+            <span>MAIN API: {mainServerOnline ? 'ONLINE' : 'OFFLINE'}</span>
           </div>
 
           {/* Offline Queue Badge */}
           {queueCount > 0 && (
-            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-500 border border-amber-500/20 animate-pulse">
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-500 border border-amber-500/20 animate-pulse font-mono">
               <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-ping"></span>
               <span>{queueCount} Queued Offline {queueCount === 1 ? 'Tx' : 'Txs'}</span>
             </div>
           )}
 
-          {/* Sync Trigger Action */}
+          {/* Sync Trigger Action - Main Database Sync (Only works when Main Server is Online) */}
           <button
-            onClick={() => triggerCloudSync()}
-            disabled={syncStatus === 'syncing'}
-            title="Sync offline-first transactions with Cloud SQL"
-            className={`p-2.5 rounded-xl border flex items-center justify-center transition-all ${
-              theme === 'dark' 
-                ? 'bg-neutral-800 hover:bg-neutral-700 border-neutral-700 text-neutral-300' 
-                : 'bg-white hover:bg-neutral-100 border-neutral-200 text-neutral-700'
-            } active:scale-95 disabled:opacity-50`}
+            onClick={() => triggerMainDatabaseSync()}
+            disabled={!mainServerOnline || syncStatus === 'syncing'}
+            title={mainServerOnline ? "Upload/Sync local MySQL data with Main Online Database" : "Main Server is offline. Sync is disabled."}
+            className={`px-3.5 py-2 rounded-xl border flex items-center gap-2 transition-all ${
+              mainServerOnline
+                ? theme === 'dark' 
+                  ? 'bg-neutral-800 hover:bg-neutral-700 border-neutral-700 text-neutral-300' 
+                  : 'bg-white hover:bg-neutral-100 border-neutral-200 text-neutral-700'
+                : 'bg-neutral-100 dark:bg-neutral-900 border-neutral-200 dark:border-neutral-800 text-neutral-400 opacity-50 cursor-not-allowed'
+            } active:scale-95`}
           >
-            <RefreshCw size={15} className={`${syncStatus === 'syncing' ? 'animate-spin text-indigo-500' : ''}`} />
+            <RefreshCw size={14} className={`${syncStatus === 'syncing' ? 'animate-spin text-indigo-500' : ''}`} />
+            <span className="text-xs font-medium">Sync</span>
           </button>
 
           {/* Google Auth Sync Integration status */}
@@ -3244,11 +3829,11 @@ export default function App() {
                         {currentEmployee ? `${currentEmployee.role} • Active` : sellerAuthUser?.email}
                       </p>
                       <span className={`inline-block mt-1 text-[9px] font-extrabold px-1.5 py-0.5 rounded uppercase font-mono ${
-                        currentEmployee?.role === 'Manager' || !currentEmployee
+                        currentEmployee?.role === 'Manager' || (!currentEmployee && (sellerAuthUser?.role === 'Manager/Owner' || !sellerAuthUser?.role))
                           ? 'bg-amber-500/10 text-amber-500'
                           : 'bg-indigo-500/10 text-indigo-500'
                       }`}>
-                        {currentEmployee ? `${currentEmployee.role} Account` : 'Owner Profile'}
+                        {currentEmployee ? `${currentEmployee.role} Account` : `${sellerAuthUser?.role || 'Manager/Owner'} Profile`}
                       </span>
                     </div>
                   </div>

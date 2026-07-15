@@ -1,1 +1,43 @@
 @import "tailwindcss";
+
+/* Global Custom Scrollbar Styling */
+
+/* Webkit browsers (Chrome, Safari, modern Edge, Opera) */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: rgba(99, 102, 241, 0.15); /* Soft indigo color */
+  border-radius: 9999px;
+  transition: background-color 0.2s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(99, 102, 241, 0.4); /* Stronger indigo highlight */
+}
+
+/* Dark mode scrollbars */
+.dark ::-webkit-scrollbar-thumb {
+  background-color: rgba(129, 140, 248, 0.2); /* Indigo/Violet in dark mode */
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(129, 140, 248, 0.5);
+}
+
+/* Firefox Support */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(99, 102, 241, 0.2) transparent;
+}
+
+.dark * {
+  scrollbar-color: rgba(129, 140, 248, 0.25) transparent;
+}
+

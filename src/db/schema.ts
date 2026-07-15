@@ -1,24 +1,33 @@
 import { relations } from 'drizzle-orm';
 import { integer, pgTable, serial, text, timestamp, numeric, boolean } from 'drizzle-orm/pg-core';
 
-// Users table (Manager/Owner registered via Google Auth)
+// Users table (Manager/Owner registered via Google Auth or email/password)
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
-  uid: text('uid').notNull().unique(), // Firebase Auth UID
+  uid: text('uid').notNull().unique(), // Firebase Auth UID or generated UID
   email: text('email').notNull(),
   name: text('name'),
-  role: text('role').default('Manager').notNull(), // 'Manager'
+  role: text('role').default('Manager').notNull(), // 'Manager' or 'Manager/Owner'
+  phone: text('phone'),
+  businessName: text('business_name'),
+  password: text('password'),
+  photoUrl: text('photo_url'),
   createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
 });
 
-// Staff profiles created by manager (synced to cloud)
+// Staff profiles created by manager or registered directly
 export const staff = pgTable('staff', {
   id: serial('id').primaryKey(),
   uid: text('uid').notNull().unique(), // Stable unique identifier across syncs (e.g. UUID)
+  email: text('email'), // Optional email for staff login
   name: text('name').notNull(),
-  pin: text('pin').notNull(), // 4-digit numeric PIN for quick switching on app entry
+  pin: text('pin'), // Made nullable to support password-based logins
   role: text('role').default('Staff').notNull(), // 'Manager' or 'Staff'
   status: text('status').default('active').notNull(), // 'active', 'inactive'
+  phone: text('phone'),
+  businessName: text('business_name'),
+  password: text('password'),
   photoUrl: text('photo_url'), // Profile picture of staff (base64 or URL)
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').defaultNow(),
@@ -65,3 +74,18 @@ export const auditLogs = pgTable('audit_logs', {
   action: text('action').notNull(), // description of action
   timestamp: timestamp('timestamp').defaultNow(),
 });
+
+// Sellers table for custom registered accounts in Seller Portal
+export const sellers = pgTable('sellers', {
+  id: serial('id').primaryKey(),
+  email: text('email').notNull().unique(),
+  phone: text('phone').notNull(),
+  businessName: text('business_name').notNull(),
+  ownerName: text('owner_name').notNull(),
+  password: text('password').notNull(),
+  role: text('role').default('Manager/Owner').notNull(),
+  photoUrl: text('photo_url'),
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+

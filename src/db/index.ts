@@ -17,7 +17,8 @@ const inMemoryStore: Record<string, any[]> = {
   staff: [],
   menu_items: [],
   orders: [],
-  audit_logs: []
+  audit_logs: [],
+  sellers: []
 };
 
 // Map of camelCase schema fields to MySQL snake_case table columns
@@ -26,6 +27,7 @@ const camelToSnakeMap: Record<string, string> = {
   email: 'email',
   name: 'name',
   role: 'role',
+  phone: 'phone',
   createdAt: 'created_at',
   updatedAt: 'updated_at',
   pin: 'pin',
@@ -51,7 +53,10 @@ const camelToSnakeMap: Record<string, string> = {
   ingredientsJson: 'ingredients_json',
   allergensJson: 'allergens_json',
   image: 'image',
-  photoUrl: 'photo_url'
+  photoUrl: 'photo_url',
+  businessName: 'business_name',
+  ownerName: 'owner_name',
+  password: 'password'
 };
 
 // Flush in-memory cache contents into native MySQL tables
@@ -119,6 +124,15 @@ let hasBootstrapped = false;
 
 // Automatically create tables in MySQL if they do not exist
 async function bootstrapMysqlTablesWithConnection(connection: any) {
+  // Helper to safely execute ALTER queries on existing databases
+  const safeAlter = async (query: string) => {
+    try {
+      await connection.query(query);
+    } catch (err: any) {
+      // Ignore errors like column already exists or table doesn't exist
+    }
+  };
+
   try {
     if (!hasBootstrapped) {
       console.log('[MySQL] Ensuring tables are bootstrapped inside MySQL Workbench...');
@@ -131,7 +145,12 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
         \`email\` VARCHAR(255) NOT NULL,
         \`name\` VARCHAR(255) NULL,
         \`role\` VARCHAR(255) NOT NULL DEFAULT 'Manager',
-        \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        \`phone\` VARCHAR(255) NULL,
+        \`business_name\` VARCHAR(255) NULL,
+        \`password\` VARCHAR(255) NULL,
+        \`photo_url\` LONGTEXT NULL,
+        \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
@@ -139,15 +158,33 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
       CREATE TABLE IF NOT EXISTS \`staff\` (
         \`id\` INT AUTO_INCREMENT PRIMARY KEY,
         \`uid\` VARCHAR(255) NOT NULL UNIQUE,
+        \`email\` VARCHAR(255) NULL,
         \`name\` VARCHAR(255) NOT NULL,
-        \`pin\` VARCHAR(255) NOT NULL,
+        \`pin\` VARCHAR(255) NULL,
         \`role\` VARCHAR(255) NOT NULL DEFAULT 'Staff',
         \`status\` VARCHAR(255) NOT NULL DEFAULT 'active',
+        \`phone\` VARCHAR(255) NULL,
+        \`business_name\` VARCHAR(255) NULL,
+        \`password\` VARCHAR(255) NULL,
         \`photo_url\` LONGTEXT NULL,
         \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    // Ensure all columns exist in any pre-existing "users" table
+    await safeAlter("ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(255) NULL");
+    await safeAlter("ALTER TABLE `users` ADD COLUMN `business_name` VARCHAR(255) NULL");
+    await safeAlter("ALTER TABLE `users` ADD COLUMN `password` VARCHAR(255) NULL");
+    await safeAlter("ALTER TABLE `users` ADD COLUMN `photo_url` LONGTEXT NULL");
+    await safeAlter("ALTER TABLE `users` ADD COLUMN `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+
+    // Ensure all columns exist in any pre-existing "staff" table
+    await safeAlter("ALTER TABLE `staff` ADD COLUMN `email` VARCHAR(255) NULL UNIQUE");
+    await safeAlter("ALTER TABLE `staff` ADD COLUMN `phone` VARCHAR(255) NULL");
+    await safeAlter("ALTER TABLE `staff` ADD COLUMN `business_name` VARCHAR(255) NULL");
+    await safeAlter("ALTER TABLE `staff` ADD COLUMN `password` VARCHAR(255) NULL");
+    await safeAlter("ALTER TABLE `staff` MODIFY COLUMN `pin` VARCHAR(255) NULL");
 
     await connection.query(`
       CREATE TABLE IF NOT EXISTS \`menu_items\` (
@@ -188,6 +225,21 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
         \`role\` VARCHAR(255) NOT NULL,
         \`action\` TEXT NOT NULL,
         \`timestamp\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS \`sellers\` (
+        \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+        \`email\` VARCHAR(255) NOT NULL UNIQUE,
+        \`phone\` VARCHAR(255) NOT NULL,
+        \`business_name\` VARCHAR(255) NOT NULL,
+        \`owner_name\` VARCHAR(255) NOT NULL,
+        \`password\` VARCHAR(255) NOT NULL,
+        \`role\` VARCHAR(255) NOT NULL DEFAULT 'Manager/Owner',
+        \`photo_url\` LONGTEXT NULL,
+        \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
@@ -273,6 +325,7 @@ function getTableName(tableObj: any): string {
   if (tableObj === schema.menuItems) return 'menu_items';
   if (tableObj === schema.orders) return 'orders';
   if (tableObj === schema.auditLogs) return 'audit_logs';
+  if (tableObj === schema.sellers) return 'sellers';
   return '';
 }
 
@@ -316,8 +369,8 @@ function executeInMemoryInsert(tableName: string, values: any[], hasOnConflict: 
   for (const val of values) {
     const item = { ...val };
     
-    // Auto-generate ids for users / staff if missing
-    if (tableName === 'users' || tableName === 'staff') {
+    // Auto-generate ids for users / staff / sellers if missing
+    if (tableName === 'users' || tableName === 'staff' || tableName === 'sellers') {
       if (!item.id) {
         item.id = store.length + 1;
       }
@@ -328,6 +381,8 @@ function executeInMemoryInsert(tableName: string, values: any[], hasOnConflict: 
       conflictIndex = store.findIndex(x => x.uid === item.uid);
     } else if (tableName === 'staff' && item.uid) {
       conflictIndex = store.findIndex(x => x.uid === item.uid);
+    } else if (tableName === 'sellers' && item.email) {
+      conflictIndex = store.findIndex(x => x.email.toLowerCase() === item.email.toLowerCase());
     } else if (tableName === 'menu_items' && item.id) {
       conflictIndex = store.findIndex(x => x.id === item.id);
     } else if (tableName === 'orders' && item.id) {

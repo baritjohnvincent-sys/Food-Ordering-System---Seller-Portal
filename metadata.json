@@ -1,0 +1,6 @@
+{
+  "name": "Food Ordering System - Seller Portal",
+  "description": "A full-stack offline-first food ordering system with cloud sync, real-time analytics, inventory management, staff roles, and thermal print simulation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

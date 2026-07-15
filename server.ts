@@ -392,6 +392,280 @@ async function startServer() {
     }
   });
 
+  // Public/Local bi-directional sync - no Firebase authorization required (for local/employee/PIN sessions)
+  app.post("/api/public/sync", async (req, res) => {
+    try {
+      const {
+        clientMenuItems = [],
+        clientStaff = [],
+        clientOrders = [],
+        clientAuditLogs = [],
+      } = req.body;
+
+      // 1. MENU ITEMS SYNC
+      const dbMenuItems = await db.select().from(menuItems);
+      const menuItemMap = new Map<string, any>(dbMenuItems.map(item => [item.id, item]));
+
+      for (const clientItem of clientMenuItems) {
+        const serverItem = menuItemMap.get(clientItem.id);
+        const clientUpdated = new Date(clientItem.updatedAt || 0).getTime();
+
+        if (!serverItem) {
+          await db.insert(menuItems).values({
+            id: clientItem.id,
+            name: clientItem.name,
+            category: clientItem.category,
+            price: String(clientItem.price),
+            inventoryQty: clientItem.inventoryQty,
+            sku: clientItem.sku || null,
+            status: clientItem.status || "active",
+            updatedAt: new Date(clientItem.updatedAt),
+            ingredientsJson: clientItem.ingredients ? JSON.stringify(clientItem.ingredients) : null,
+            allergensJson: clientItem.allergens ? JSON.stringify(clientItem.allergens) : null,
+            image: clientItem.image || null,
+          });
+        } else {
+          const serverUpdated = new Date(serverItem.updatedAt || 0).getTime();
+          if (clientUpdated > serverUpdated) {
+            await db.update(menuItems)
+              .set({
+                name: clientItem.name,
+                category: clientItem.category,
+                price: String(clientItem.price),
+                inventoryQty: clientItem.inventoryQty,
+                sku: clientItem.sku || null,
+                status: clientItem.status || "active",
+                updatedAt: new Date(clientItem.updatedAt),
+                ingredientsJson: clientItem.ingredients ? JSON.stringify(clientItem.ingredients) : null,
+                allergensJson: clientItem.allergens ? JSON.stringify(clientItem.allergens) : null,
+                image: clientItem.image || null,
+              })
+              .where(eq(menuItems.id, clientItem.id));
+          }
+        }
+      }
+
+      // 2. STAFF SYNC
+      const dbStaff = await db.select().from(staff);
+      const staffMap = new Map<string, any>(dbStaff.map(member => [member.uid, member]));
+
+      for (const clientMember of clientStaff) {
+        const serverMember = staffMap.get(clientMember.uid);
+        const clientUpdated = new Date(clientMember.updatedAt || 0).getTime();
+
+        if (!serverMember) {
+          await db.insert(staff).values({
+            uid: clientMember.uid,
+            name: clientMember.name,
+            pin: clientMember.pin,
+            role: clientMember.role || "Staff",
+            status: clientMember.status || "active",
+            photoUrl: clientMember.photoUrl || null,
+            updatedAt: new Date(clientMember.updatedAt || Date.now()),
+          });
+        } else {
+          const serverUpdated = new Date(serverMember.updatedAt || 0).getTime();
+          if (clientUpdated > serverUpdated) {
+            await db.update(staff)
+              .set({
+                name: clientMember.name,
+                pin: clientMember.pin,
+                role: clientMember.role || "Staff",
+                status: clientMember.status || "active",
+                photoUrl: clientMember.photoUrl || serverMember.photoUrl,
+                updatedAt: new Date(clientMember.updatedAt),
+              })
+              .where(eq(staff.uid, clientMember.uid));
+          }
+        }
+      }
+
+      // 3. ORDERS SYNC
+      const dbOrders = await db.select().from(orders);
+      const ordersMap = new Map<string, any>(dbOrders.map(order => [order.id, order]));
+
+      for (const clientOrder of clientOrders) {
+        const serverOrder = ordersMap.get(clientOrder.id);
+        const clientUpdated = new Date(clientOrder.updatedAt || 0).getTime();
+
+        if (!serverOrder) {
+          await db.insert(orders).values({
+            id: clientOrder.id,
+            orderNumber: clientOrder.orderNumber,
+            customerName: clientOrder.customerName || null,
+            customerPhone: clientOrder.customerPhone || null,
+            deliveryAddress: clientOrder.deliveryAddress || null,
+            itemsJson: JSON.stringify(clientOrder.items),
+            totalAmount: String(clientOrder.totalAmount),
+            paymentStatus: clientOrder.paymentStatus || "unpaid",
+            paymentMethod: clientOrder.paymentMethod || "cash",
+            orderStatus: clientOrder.orderStatus || "received",
+            actionBy: clientOrder.actionBy || "System",
+            stockReduced: clientOrder.stockReduced || false,
+            createdAt: new Date(clientOrder.createdAt),
+            updatedAt: new Date(clientOrder.updatedAt),
+          });
+        } else {
+          const serverUpdated = new Date(serverOrder.updatedAt || 0).getTime();
+          if (clientUpdated > serverUpdated) {
+            await db.update(orders)
+              .set({
+                orderNumber: clientOrder.orderNumber,
+                customerName: clientOrder.customerName || null,
+                customerPhone: clientOrder.customerPhone || null,
+                deliveryAddress: clientOrder.deliveryAddress || null,
+                itemsJson: JSON.stringify(clientOrder.items),
+                totalAmount: String(clientOrder.totalAmount),
+                paymentStatus: clientOrder.paymentStatus || "unpaid",
+                paymentMethod: clientOrder.paymentMethod || "cash",
+                orderStatus: clientOrder.orderStatus || "received",
+                actionBy: clientOrder.actionBy || "System",
+                stockReduced: clientOrder.stockReduced || false,
+                updatedAt: new Date(clientOrder.updatedAt),
+              })
+              .where(eq(orders.id, clientOrder.id));
+          }
+        }
+      }
+
+      // 4. AUDIT LOGS SYNC
+      const dbAuditLogs = await db.select().from(auditLogs);
+      const logsMap = new Map(dbAuditLogs.map(log => [log.id, log]));
+
+      for (const clientLog of clientAuditLogs) {
+        const serverLog = logsMap.get(clientLog.id);
+        if (!serverLog) {
+          await db.insert(auditLogs).values({
+            id: clientLog.id,
+            employeeName: clientLog.employeeName,
+            role: clientLog.role,
+            action: clientLog.action,
+            timestamp: new Date(clientLog.timestamp),
+          });
+        }
+      }
+
+      // Fetch consolidated latest status to return to client
+      const finalMenuItems = await db.select().from(menuItems);
+      const finalStaff = await db.select().from(staff);
+      const finalOrders = await db.select().from(orders);
+      const finalAuditLogs = await db.select().from(auditLogs);
+
+      res.json({
+        success: true,
+        menuItems: finalMenuItems.map(item => ({
+          ...item,
+          price: parseFloat(item.price),
+          ingredients: item.ingredientsJson ? JSON.parse(item.ingredientsJson) : [],
+          allergens: item.allergensJson ? JSON.parse(item.allergensJson) : [],
+        })),
+        staff: finalStaff,
+        orders: finalOrders.map(order => ({
+          ...order,
+          price: parseFloat(order.totalAmount),
+          totalAmount: parseFloat(order.totalAmount),
+          items: JSON.parse(order.itemsJson),
+        })),
+        auditLogs: finalAuditLogs,
+        serverTime: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      console.error("Critical error in public sync:", error);
+      res.status(500).json({ error: error.message || "Failed to finalize local synchronization" });
+    }
+  });
+
+  // Public/Local operations replay sync - no Firebase authorization required
+  app.post("/api/public/sync/operations", async (req, res) => {
+    try {
+      const { operations = [] } = req.body;
+      if (!Array.isArray(operations)) {
+        return res.status(400).json({ error: "Invalid operations payload" });
+      }
+
+      console.log(`[SyncEngine] Processing ${operations.length} public queued offline operations.`);
+
+      for (const op of operations) {
+        const { type, payload } = op;
+        if (!payload) continue;
+
+        try {
+          if (type === 'CREATE_PRODUCT' || type === 'UPDATE_PRODUCT') {
+            await db.insert(menuItems).values({
+              id: payload.id,
+              name: payload.name,
+              category: payload.category,
+              price: String(payload.price),
+              inventoryQty: Number(payload.inventoryQty),
+              sku: payload.sku || null,
+              status: payload.status || "active",
+              updatedAt: new Date(payload.updatedAt || Date.now()),
+              ingredientsJson: payload.ingredients ? JSON.stringify(payload.ingredients) : null,
+              allergensJson: payload.allergens ? JSON.stringify(payload.allergens) : null,
+              image: payload.image || null,
+            }).onConflictDoUpdate({
+              target: menuItems.id,
+              set: {
+                name: payload.name,
+                category: payload.category,
+                price: String(payload.price),
+                inventoryQty: Number(payload.inventoryQty),
+                sku: payload.sku || null,
+                status: payload.status || "active",
+                updatedAt: new Date(payload.updatedAt || Date.now()),
+                ingredientsJson: payload.ingredients ? JSON.stringify(payload.ingredients) : null,
+                allergensJson: payload.allergens ? JSON.stringify(payload.allergens) : null,
+                image: payload.image || null,
+              }
+            });
+          } else if (type === 'DELETE_PRODUCT') {
+            await db.delete(menuItems).where(eq(menuItems.id, payload.id));
+          } else if (type === 'CREATE_ORDER' || type === 'UPDATE_ORDER') {
+            await db.insert(orders).values({
+              id: payload.id,
+              orderNumber: payload.orderNumber,
+              customerName: payload.customerName || null,
+              customerPhone: payload.customerPhone || null,
+              deliveryAddress: payload.deliveryAddress || null,
+              itemsJson: JSON.stringify(payload.items),
+              totalAmount: String(payload.totalAmount),
+              paymentStatus: payload.paymentStatus || "unpaid",
+              paymentMethod: payload.paymentMethod || "cash",
+              orderStatus: payload.orderStatus || "received",
+              actionBy: payload.actionBy || "System",
+              stockReduced: payload.stockReduced || false,
+              createdAt: new Date(payload.createdAt || Date.now()),
+              updatedAt: new Date(payload.updatedAt || Date.now()),
+            }).onConflictDoUpdate({
+              target: orders.id,
+              set: {
+                orderNumber: payload.orderNumber,
+                customerName: payload.customerName || null,
+                customerPhone: payload.customerPhone || null,
+                deliveryAddress: payload.deliveryAddress || null,
+                itemsJson: JSON.stringify(payload.items),
+                totalAmount: String(payload.totalAmount),
+                paymentStatus: payload.paymentStatus || "unpaid",
+                paymentMethod: payload.paymentMethod || "cash",
+                orderStatus: payload.orderStatus || "received",
+                actionBy: payload.actionBy || "System",
+                stockReduced: payload.stockReduced || false,
+                updatedAt: new Date(payload.updatedAt || Date.now()),
+              }
+            });
+          }
+        } catch (opError: any) {
+          console.error(`Error processing public individual operation ${op.id} (${type}):`, opError);
+        }
+      }
+
+      res.json({ success: true, processedCount: operations.length });
+    } catch (error: any) {
+      console.error("Critical error in public operations sync:", error);
+      res.status(500).json({ error: error.message || "Failed to sync queued operations" });
+    }
+  });
+
   // Register Google Authed Manager inside PostgreSQL
   app.post("/api/register", requireAuth, async (req: AuthRequest, res) => {
     try {
@@ -501,6 +775,7 @@ async function startServer() {
             pin: clientMember.pin,
             role: clientMember.role || "Staff",
             status: clientMember.status || "active",
+            photoUrl: clientMember.photoUrl || null,
             updatedAt: new Date(clientMember.updatedAt || Date.now()),
           });
         } else {
@@ -512,6 +787,7 @@ async function startServer() {
                 pin: clientMember.pin,
                 role: clientMember.role || "Staff",
                 status: clientMember.status || "active",
+                photoUrl: clientMember.photoUrl || serverMember.photoUrl,
                 updatedAt: new Date(clientMember.updatedAt),
               })
               .where(eq(staff.uid, clientMember.uid));

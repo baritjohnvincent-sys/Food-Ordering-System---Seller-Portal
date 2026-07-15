@@ -56,12 +56,17 @@ const camelToSnakeMap: Record<string, string> = {
 
 // Flush in-memory cache contents into native MySQL tables
 async function flushInMemoryStoreToMysql(connection: any) {
-  console.log('[Database] Synchronizing offline/in-memory data to MySQL Workbench (System Database) first...');
   const tables = Object.keys(inMemoryStore);
+  let totalSynced = 0;
   for (const table of tables) {
     const rows = inMemoryStore[table] || [];
     if (rows.length === 0) continue;
+    
+    if (totalSynced === 0) {
+      console.log('[Database] Synchronizing offline/in-memory data to MySQL Workbench (System Database) first...');
+    }
     console.log(`[Database Sync] Found ${rows.length} pending rows in offline cache for "${table}". Syncing now...`);
+    totalSynced += rows.length;
     
     for (const row of rows) {
       const dbRow: Record<string, any> = {};
@@ -105,13 +110,19 @@ async function flushInMemoryStoreToMysql(connection: any) {
     // Successfully synced, clear local cache for this table
     inMemoryStore[table] = [];
   }
-  console.log('[Database Sync] Offline/in-memory cache successfully synchronized to MySQL Workbench!');
+  if (totalSynced > 0) {
+    console.log('[Database Sync] Offline/in-memory cache successfully synchronized to MySQL Workbench!');
+  }
 }
+
+let hasBootstrapped = false;
 
 // Automatically create tables in MySQL if they do not exist
 async function bootstrapMysqlTablesWithConnection(connection: any) {
   try {
-    console.log('[MySQL] Ensuring tables are bootstrapped inside MySQL Workbench...');
+    if (!hasBootstrapped) {
+      console.log('[MySQL] Ensuring tables are bootstrapped inside MySQL Workbench...');
+    }
     
     await connection.query(`
       CREATE TABLE IF NOT EXISTS \`users\` (
@@ -180,7 +191,10 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    console.log('[MySQL] MySQL Workbench Tables successfully verified & bootstrapped.');
+    if (!hasBootstrapped) {
+      console.log('[MySQL] MySQL Workbench Tables successfully verified & bootstrapped.');
+      hasBootstrapped = true;
+    }
   } catch (err: any) {
     console.error('[MySQL Setup Error] Could not bootstrap database tables:', err.message);
     throw err;

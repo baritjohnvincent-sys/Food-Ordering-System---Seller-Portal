@@ -312,6 +312,9 @@ export default function App() {
     // Fetch initial offline operations queue count
     updateQueueCount();
 
+    // Instantly synchronize with the MySQL system database on initialization/refresh
+    triggerCloudSync(null, true);
+
     // Monitor Firebase Auth login
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
@@ -993,16 +996,6 @@ export default function App() {
   // Cloud Synchronizer (Bi-directional comparison with Conflict Resolution)
   const triggerCloudSync = async (usrToUse: FirebaseUser | null = googleUser, silent: boolean = false) => {
     const userToAuth = usrToUse || auth.currentUser;
-    if (!userToAuth) {
-      if (!silent) {
-        triggerDialog(
-          "Cloud Sync Required",
-          "Manager must log in with a Google Account first to use Cloud Sync functionality.",
-          "info"
-        );
-      }
-      return;
-    }
     if (!navigator.onLine) {
       if (!silent) {
         showToast("No internet connection. Your changes are saved offline!", "warning");
@@ -1012,21 +1005,38 @@ export default function App() {
 
     if (!silent) setSyncStatus('syncing');
     try {
-      const token = await userToAuth.getIdToken();
-      // Prepare local copies to push to cloud
-      const response = await fetch('/api/sync', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          clientMenuItems: menuItems,
-          clientStaff: staff,
-          clientOrders: orders,
-          clientAuditLogs: auditLogs,
-        })
-      });
+      let response;
+      if (userToAuth) {
+        const token = await userToAuth.getIdToken();
+        // Prepare local copies to push to cloud
+        response = await fetch('/api/sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            clientMenuItems: menuItems,
+            clientStaff: staff,
+            clientOrders: orders,
+            clientAuditLogs: auditLogs,
+          })
+        });
+      } else {
+        // Local database sync for local/PIN-based/anonymous sessions with MySQL Workbench
+        response = await fetch('/api/public/sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            clientMenuItems: menuItems,
+            clientStaff: staff,
+            clientOrders: orders,
+            clientAuditLogs: auditLogs,
+          })
+        });
+      }
 
       if (!response.ok) {
         throw new Error("Server responded with failure");
@@ -1079,7 +1089,6 @@ export default function App() {
   const syncQueuedOperations = async (usrToUse: FirebaseUser | null = googleUser, silent: boolean = false) => {
     const userToAuth = usrToUse || auth.currentUser;
     await updateQueueCount();
-    if (!userToAuth) return;
     if (!navigator.onLine) return;
 
     try {
@@ -1087,17 +1096,28 @@ export default function App() {
       if (queue.length === 0) return;
 
       if (!silent) setSyncStatus('syncing');
-      console.log(`[SyncManager] Pushing ${queue.length} offline operations to cloud...`);
+      console.log(`[SyncManager] Pushing ${queue.length} offline operations to database...`);
 
-      const token = await userToAuth.getIdToken();
-      const response = await fetch('/api/sync/operations', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ operations: queue })
-      });
+      let response;
+      if (userToAuth) {
+        const token = await userToAuth.getIdToken();
+        response = await fetch('/api/sync/operations', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ operations: queue })
+        });
+      } else {
+        response = await fetch('/api/public/sync/operations', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ operations: queue })
+        });
+      }
 
       if (!response.ok) {
         throw new Error("Failed to sync operations");

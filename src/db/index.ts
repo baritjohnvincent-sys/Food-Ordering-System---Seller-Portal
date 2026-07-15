@@ -256,6 +256,20 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
 // Resilient reconnection and synchronization trigger
 async function tryConnectAndBootstrap() {
   try {
+    // Auto-create MySQL database if it doesn't exist
+    try {
+      const tempConnection = await mysql.createConnection({
+        host: mysqlHost,
+        user: mysqlUser,
+        password: mysqlPassword,
+        port: mysqlPort,
+      });
+      await tempConnection.query(`CREATE DATABASE IF NOT EXISTS \`${mysqlDatabase}\``);
+      await tempConnection.end();
+    } catch (dbCreateErr: any) {
+      console.warn('[Database Setup Info] Database existence check returned:', dbCreateErr.message);
+    }
+
     let connection: any = null;
     
     // Check if the current pool is functional

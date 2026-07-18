@@ -31,7 +31,7 @@ export interface Order {
   totalAmount: number;
   paymentStatus: 'paid' | 'unpaid';
   paymentMethod: 'cash' | 'e-wallet' | 'card';
-  orderStatus: 'received' | 'preparing' | 'ready' | 'completed' | 'cancelled';
+  orderStatus: 'pending' | 'received' | 'preparing' | 'ready' | 'completed' | 'cancelled';
   actionBy: string;
   stockReduced?: boolean;
   customerPhone?: string | null;

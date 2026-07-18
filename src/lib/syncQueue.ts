@@ -8,7 +8,7 @@
 
 export interface QueuedOperation {
   id: string;
-  type: 'CREATE_PRODUCT' | 'UPDATE_PRODUCT' | 'DELETE_PRODUCT' | 'CREATE_ORDER' | 'UPDATE_ORDER';
+  type: 'CREATE_PRODUCT' | 'UPDATE_PRODUCT' | 'DELETE_PRODUCT' | 'CREATE_ORDER' | 'UPDATE_ORDER' | 'CREATE_STAFF' | 'UPDATE_STAFF' | 'DELETE_STAFF';
   payload: any;
   timestamp: string;
 }

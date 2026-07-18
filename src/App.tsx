@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Plus, Edit, Trash2, Shield, Users, BarChart3, Database, Wifi, WifiOff,
   Printer, Moon, Sun, ShoppingCart, User, Key, KeyRound, Clock, Utensils,
@@ -7,12 +7,6 @@ import {
   Eye, EyeOff, Mail, ChevronRight, Download, VolumeX, Battery, Home, Power, MessageSquare, FileText, Cookie, LogOut
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  auth, googleAuthProvider 
-} from './lib/firebase.ts';
-import { 
-  signInWithPopup, signOut, onAuthStateChanged, User as FirebaseUser 
-} from 'firebase/auth';
 import { 
   MenuItem, Order, OrderItem, StaffMember, AuditLog, 
   ActiveTab, SyncStatus, Theme 
@@ -82,13 +76,20 @@ export default function App() {
   const [staff, setStaff] = useState<StaffMember[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
 
-  // Authentication & Cloud Sync
-  const [googleUser, setGoogleUser] = useState<FirebaseUser | null>(null);
-  const [dbRegistered, setDbRegistered] = useState<boolean>(false);
+  // Cloud Sync
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('idle');
   const [lastSyncText, setLastSyncText] = useState<string>('Not synchronized yet');
   const [mainServerOnline, setMainServerOnline] = useState<boolean>(false);
   const [checkingMainServer, setCheckingMainServer] = useState<boolean>(false);
+
+  // Disable automatic remote sync when developing or troubleshooting persistent data
+  const envFlag = ((import.meta as any)?.env?.VITE_DISABLE_REMOTE_SYNC === '1') || ((import.meta as any)?.env?.VITE_DISABLE_REMOTE_SYNC === 'true');
+  const localFlag = (typeof window !== 'undefined' && (localStorage.getItem('food_disable_remote_sync') === '1' || localStorage.getItem('food_disable_remote_sync') === 'true'));
+  const disableRemoteSync = Boolean(envFlag || localFlag);
+
+  // Debug: expose effective sync configuration
+  // eslint-disable-next-line no-console
+  console.log('[Debug] disableRemoteSync=', disableRemoteSync, 'envFlag=', envFlag, 'localFlag=', localFlag);
 
   // Employee Login State (PIN authentication)
   const [currentEmployee, setCurrentEmployee] = useState<StaffMember | null>(null);
@@ -129,12 +130,14 @@ export default function App() {
   const [custPayment, setCustPayment] = useState<'cash' | 'e-wallet' | 'card'>('cash');
   const [customerView, setCustomerView] = useState<'products' | 'cart' | 'checkout' | 'success'>('products');
   const [lastSimulatedOrder, setLastSimulatedOrder] = useState<any>(null);
+  const [customerStatusNotice, setCustomerStatusNotice] = useState<{ title: string; body: string } | null>(null);
   const [simulatedApiLogs, setSimulatedApiLogs] = useState<{ id: string; method: string; url: string; timestamp: string; type: 'request' | 'response'; payload?: string }[]>([]);
+  const processedOrderIdsRef = useRef<Set<string>>(new Set());
 
   // Simulated smartphone states
   const [isPhoneLocked, setIsPhoneLocked] = useState<boolean>(false);
   const [isPhonePowerOff, setIsPhonePowerOff] = useState<boolean>(false);
-  const [phoneActiveApp, setPhoneActiveApp] = useState<'home' | 'food_app' | 'splash'>('food_app');
+  const [phoneActiveApp, setPhoneActiveApp] = useState<'home' | 'food_app' | 'splash' | 'gallery' | 'messages' | 'settings'>('food_app');
   const [simulatedBattery, setSimulatedBattery] = useState<number>(85);
   const [simulatedWifi, setSimulatedWifi] = useState<boolean>(true);
   const [simulatedVolume, setSimulatedVolume] = useState<number>(70);
@@ -337,39 +340,15 @@ export default function App() {
     updateQueueCount();
 
     // Instantly synchronize with the MySQL system database on initialization/refresh
-    triggerCloudSync(null, true);
-
-    // Monitor Firebase Auth login
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (user) {
-        setGoogleUser(user);
-        // Automatically request server registration
-        try {
-          const token = await user.getIdToken();
-          const response = await fetch('/api/register', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${token}`
-            }
-          });
-          if (response.ok) {
-            setDbRegistered(true);
-            triggerCloudSync(user);
-          }
-        } catch (e) {
-          console.error("Auto register/sync failure:", e);
-        }
-      } else {
-        setGoogleUser(null);
-        setDbRegistered(false);
-      }
-    });
+    if (!disableRemoteSync) {
+      triggerCloudSync(true);
+    } else {
+      setLastSyncText('Remote sync disabled');
+    }
 
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
-      unsubscribe();
     };
   }, []);
 
@@ -382,39 +361,141 @@ export default function App() {
     }
   }, [online]);
 
+  const defaultSellerApiUrl = 'https://renovator-hardener-dispersed.ngrok-free.dev/';
+
   // Helper to normalize Main Server API Base URL
   const getMainServerApiUrl = () => {
     const meta = import.meta as any;
-    let url = meta.env.VITE_ADMIN_API_URL || meta.env.VITE_CUSTOMER_API_URL || 'https://visible-whomever-sprint.ngrok-free.dev/';
-    if (url && !url.endsWith('/')) {
-      url += '/';
+    const env = meta?.env || {};
+    const baseUrl = env.VITE_SELLER_API_URL || env.VITE_ADMIN_API_URL || env.VITE_CUSTOMER_API_URL || defaultSellerApiUrl;
+    const normalized = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+    const localOrigin = `${window.location.origin}/`;
+    const isLocalDev = Boolean(meta.env?.DEV || window.location.hostname.includes('localhost') || window.location.hostname === '127.0.0.1');
+
+    if (isLocalDev) {
+      console.log('[Debug] getMainServerApiUrl -> local dev detected, using local origin', localOrigin);
+      return localOrigin;
     }
-    return url;
+
+    console.log('[Debug] getMainServerApiUrl ->', normalized);
+    return normalized;
+  };
+
+  const getOrderApiBaseUrl = () => {
+    const meta = import.meta as any;
+    const env = meta?.env || {};
+    const baseUrl = env.VITE_SELLER_API_URL || env.VITE_ADMIN_API_URL || env.VITE_CUSTOMER_API_URL || defaultSellerApiUrl;
+    const normalized = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+    const localOrigin = `${window.location.origin}/`;
+    const isLocalDev = Boolean(meta.env?.DEV || window.location.hostname.includes('localhost') || window.location.hostname === '127.0.0.1');
+
+    if (disableRemoteSync || isLocalDev) {
+      console.log('[Debug] getOrderApiBaseUrl -> local dev or remote sync disabled, using local origin', localOrigin);
+      return localOrigin;
+    }
+
+    console.log('[Debug] getOrderApiBaseUrl ->', normalized);
+    return normalized;
+  };
+
+  const fetchOrdersFromRemoteApi = async () => {
+    if (disableRemoteSync) return null;
+    const baseUrl = getOrderApiBaseUrl();
+    const token = (import.meta as any)?.env?.VITE_SELLER_API_TOKEN || '';
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+    };
+
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    if (sellerAuthUser?.email) {
+      headers['x-seller-email'] = sellerAuthUser.email.toLowerCase();
+    }
+
+    const meta = import.meta as any;
+    const isLocalDev = Boolean(meta.env?.DEV || window.location.hostname.includes('localhost') || window.location.hostname === '127.0.0.1');
+    const hasSellerAuth = Boolean(token || sellerAuthUser?.email);
+
+    const candidatePaths = isLocalDev
+      ? ['/api/public/orders', '/api/orders', '/orders', '/api/seller/orders', '/api/orders/checkout']
+      : ['/api/seller/orders', '/api/public/orders', '/api/orders', '/orders', '/api/orders/checkout'];
+
+    for (const path of candidatePaths) {
+      if (path === '/api/seller/orders' && !hasSellerAuth) {
+        console.log('[Remote Orders] Skipping protected seller route because no auth token/email is available');
+        continue;
+      }
+
+      try {
+        const fullUrl = `${baseUrl.replace(/\/$/, '')}${path}`;
+        const response = await fetch(fullUrl, {
+          method: 'GET',
+          cache: 'no-store',
+          headers,
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data && Array.isArray(data.orders)) {
+            return data;
+          }
+        } else {
+          console.warn(`[Remote Orders] ${fullUrl} returned ${response.status}`);
+        }
+      } catch (err) {
+        console.warn('[Remote Orders] Fetch failed for', path, err);
+        // Ignore and try the next candidate path.
+      }
+    }
+
+    return null;
   };
 
   // Perform a background ping to check the online status of the Main Server API connection
   const checkMainServerStatus = async () => {
     setCheckingMainServer(true);
     try {
-      const url = getMainServerApiUrl();
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4000);
-      
-      const res = await fetch(`${url}api/health`, {
-        method: 'GET',
-        signal: controller.signal,
-        headers: {
-          'Accept': 'application/json'
-        }
-      });
-      clearTimeout(timeoutId);
-      
-      if (res.ok) {
-        setMainServerOnline(true);
-      } else {
-        setMainServerOnline(false);
+      const candidateBases = [getMainServerApiUrl()];
+      const localOrigin = `${window.location.origin}/`;
+      if (!candidateBases.includes(localOrigin)) {
+        candidateBases.push(localOrigin);
       }
+
+      let isServerOnline = false;
+      for (const base of candidateBases) {
+        const normalizedBase = base.endsWith('/') ? base : `${base}/`;
+        const healthUrl = `${normalizedBase}api/health`;
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 4000);
+
+          const res = await fetch(healthUrl, {
+            method: 'GET',
+            signal: controller.signal,
+            headers: {
+              Accept: 'application/json',
+            },
+          });
+
+          clearTimeout(timeoutId);
+
+          if (res.ok) {
+            console.log('[Health Check] Main API is online at', healthUrl);
+            isServerOnline = true;
+            setLastSyncText(`Main API reachable at: ${normalizedBase}`);
+            break;
+          }
+
+          console.warn('[Health Check] Main API returned non-OK status at', healthUrl, res.status);
+        } catch (err) {
+          console.warn('[Health Check] Main API unreachable at', healthUrl, err);
+        }
+      }
+
+      setMainServerOnline(isServerOnline);
     } catch (err) {
+      console.warn('[Health Check] Unexpected error while checking main server status', err);
       setMainServerOnline(false);
     } finally {
       setCheckingMainServer(false);
@@ -423,28 +504,111 @@ export default function App() {
 
   // Periodically check Main Server connection status and execute local auto-saves
   useEffect(() => {
-    // Initial check and initial local save
-    checkMainServerStatus();
-    triggerCloudSync(googleUser, true);
+    // Create interval holders that may remain null when remote sync is disabled
+    let mainServerInterval: any = null;
+    let liveOrderPollInterval: any = null;
 
-    const mainServerInterval = setInterval(checkMainServerStatus, 8000);
+    if (!disableRemoteSync) {
+      // Initial check and initial local save
+      void checkMainServerStatus();
+      void triggerCloudSync(true);
+      void pullOrdersFromBackend(true);
+
+      mainServerInterval = setInterval(() => {
+        void checkMainServerStatus();
+      }, 8000);
+
+      // Poll the backend for new customer orders so the seller queue stays in sync with external integrations.
+      liveOrderPollInterval = setInterval(() => {
+        void pullOrdersFromBackend(true);
+      }, 30000);
+    } else {
+      setLastSyncText('Remote sync disabled');
+    }
     
     // Periodically auto-save all operations to the local device MySQL database (every 8 seconds)
-    // regardless of whether we have a Google account or if the main server is online
     const localSaveInterval = setInterval(async () => {
       try {
-        await syncQueuedOperations(googleUser, true);
-        await triggerCloudSync(googleUser, true);
+        await syncQueuedOperations(true);
+        if (!disableRemoteSync) {
+          await triggerCloudSync(true);
+        }
       } catch (err) {
         console.warn("[Local DB Sync] Background auto-save to local MySQL failed:", err);
       }
     }, 8000);
 
     return () => {
-      clearInterval(mainServerInterval);
+      if (mainServerInterval) clearInterval(mainServerInterval);
+      if (liveOrderPollInterval) clearInterval(liveOrderPollInterval);
       clearInterval(localSaveInterval);
     };
-  }, [googleUser]);
+  }, []);
+
+  useEffect(() => {
+    const eventSource = new EventSource('/api/events');
+
+    eventSource.addEventListener('connected', () => {
+      console.log('[Integration] Live order stream connected.');
+    });
+
+    eventSource.addEventListener('new-order', (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        const incomingOrder = payload?.order;
+        if (!incomingOrder) return;
+
+        const normalizedOrder = {
+          ...incomingOrder,
+          orderStatus: incomingOrder.orderStatus || incomingOrder.status || 'received',
+          totalAmount: Number(incomingOrder.totalAmount ?? 0),
+        };
+
+        const currentLocalOrders = JSON.parse(localStorage.getItem('food_orders') || '[]');
+        const alreadyExists = currentLocalOrders.some((order: any) => order.id === normalizedOrder.id);
+        if (!alreadyExists) {
+          const nextOrders = [normalizedOrder, ...currentLocalOrders];
+          saveLocalOrders(nextOrders);
+          notifySellerOfIncomingOrder(normalizedOrder, 'event');
+          console.log('[Integration] Live order event received:', normalizedOrder);
+        }
+      } catch (err) {
+        console.warn('[Integration] Failed to process live order event:', err);
+      }
+    });
+
+    eventSource.addEventListener('order-status-updated', (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        const updatedOrder = payload?.order;
+        if (!updatedOrder) return;
+
+        const currentLocalOrders = JSON.parse(localStorage.getItem('food_orders') || '[]');
+        const nextOrders = currentLocalOrders.map((order: any) => order.id === updatedOrder.id ? {
+          ...order,
+          ...updatedOrder,
+          orderStatus: updatedOrder.orderStatus || updatedOrder.status || order.orderStatus,
+          totalAmount: Number(updatedOrder.totalAmount ?? order.totalAmount ?? 0),
+        } : order);
+
+        saveLocalOrders(nextOrders);
+        setPhoneNotification({
+          title: `Order updated #${updatedOrder.orderNumber || updatedOrder.id}`,
+          body: `Your order is now ${String(updatedOrder.orderStatus || 'updated').toUpperCase()}`
+        });
+        notifyCustomerOfStatusChange(updatedOrder, payload?.previousStatus);
+        setTimeout(() => setPhoneNotification(null), 5000);
+      } catch (err) {
+        console.warn('[Integration] Failed to process status update event:', err);
+      }
+    });
+
+    eventSource.onerror = () => {
+      console.warn('[Integration] Live order stream disconnected.');
+    };
+
+    return () => eventSource.close();
+  }, []);
 
   // Polling for email verification status during registration
   useEffect(() => {
@@ -504,6 +668,7 @@ export default function App() {
       const liveOrderInDb = orders.find(o => o.id === lastSimulatedOrder.id);
       if (liveOrderInDb && liveOrderInDb.orderStatus !== lastSimulatedOrder.orderStatus) {
         setLastSimulatedOrder(liveOrderInDb);
+        notifyCustomerOfStatusChange(liveOrderInDb, lastSimulatedOrder.orderStatus);
 
         let statusEmoji = "🔔";
         if (liveOrderInDb.orderStatus === 'preparing') statusEmoji = "🍳";
@@ -525,6 +690,12 @@ export default function App() {
     }
   }, [orders, lastSimulatedOrder]);
   
+  useEffect(() => {
+    if (!customerStatusNotice) return;
+    const timer = setTimeout(() => setCustomerStatusNotice(null), 6000);
+    return () => clearTimeout(timer);
+  }, [customerStatusNotice]);
+
   // Real-time ticking clock & slow battery discharge for the smartphone simulator
   useEffect(() => {
     const updateTime = () => {
@@ -644,6 +815,7 @@ export default function App() {
     };
 
     setSellerAuthUser(userInfo);
+    if (!disableRemoteSync) void pullOrdersFromBackend(true);
     writeAuditLog(`Seller logged in successfully to ${user.businessName}`);
 
     // If remember me is checked, set persistent cookie (valid for 30 days)
@@ -679,35 +851,8 @@ export default function App() {
       setRecaptchaVerified(true);
 
       if (user) {
-        // Trigger 2FA if they don't have a persistent session on this browser
-        const hasPersistentCookie = getCookie('food_persistent_session');
-        
-        if (!hasPersistentCookie) {
-          // Trigger 2FA email dispatch
-          const response = await fetch('/api/auth/send-otp', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: user.email }),
-          });
-
-          const result = await response.json();
-          setLoginLoading(false);
-
-          if (response.ok && result.success) {
-            setOtpPreviewUrl(result.previewUrl || '');
-            setLocalBypassOtp(result.localBypassOtp || '');
-            setOtpSentCode('dispatched'); // flag to show OTP form
-            setSellerAuthView('otp_verification');
-            setShowOtpNotification(true);
-            writeAuditLog(`2FA OTP Code sent to email ${user.email} for ${user.businessName}`);
-          } else {
-            setLoginError(result.error || 'Failed to dispatch 2FA verification email. Please try again.');
-          }
-        } else {
-          // Bypassed 2FA directly because of Remember Me persistent cookie
-          setLoginLoading(false);
-          completeLoginSession(user);
-        }
+        setLoginLoading(false);
+        completeLoginSession(user);
       } else {
         setLoginLoading(false);
         setLoginError('Invalid credentials. Please verify your email/phone or password.');
@@ -855,10 +1000,15 @@ export default function App() {
       setOtpLoading(false);
 
       if (response.ok && result.success) {
-        // Add pendingSeller to registered list
-        const registered = getRegisteredSellers();
-        const updated = [...registered, pendingSeller];
-        localStorage.setItem('food_registered_sellers', JSON.stringify(updated));
+        try {
+          const syncResponse = await fetch('/api/auth/sellers');
+          const syncData = await syncResponse.json();
+          if (syncResponse.ok && syncData.success && Array.isArray(syncData.sellers)) {
+            localStorage.setItem('food_registered_sellers', JSON.stringify(syncData.sellers));
+          }
+        } catch (syncErr) {
+          console.warn('Could not refresh registered sellers from backend:', syncErr);
+        }
 
         writeAuditLog(`Registered and Verified new Seller partner: ${pendingSeller.businessName} owned by ${pendingSeller.ownerName}`);
         
@@ -1021,29 +1171,29 @@ export default function App() {
       setOtpLoading(false);
 
       if (response.ok && result.success) {
-        // Now update the seller password in localStorage food_registered_sellers list!
-        const registered = getRegisteredSellers();
-        const userIndex = registered.findIndex((u: any) => u.email.toLowerCase() === forgotEmail.toLowerCase());
-        
-        if (userIndex !== -1) {
-          registered[userIndex].password = newPassword;
-          localStorage.setItem('food_registered_sellers', JSON.stringify(registered));
-          writeAuditLog(`Password reset successfully saved for Seller partner: ${forgotEmail}`);
-          
-          setLoginEmail(forgotEmail);
-          setForgotEmail('');
-          setNewPassword('');
-          setConfirmNewPassword('');
-          setSellerAuthView('login');
-
-          triggerDialog(
-            "Password Reset Completed! 🔐",
-            "Your account password has been updated. You can now use your new credentials to log in.",
-            "success"
-          );
-        } else {
-          setOtpError("Failed to update password. Seller profile not found.");
+        try {
+          const syncResponse = await fetch('/api/auth/sellers');
+          const syncData = await syncResponse.json();
+          if (syncResponse.ok && syncData.success && Array.isArray(syncData.sellers)) {
+            localStorage.setItem('food_registered_sellers', JSON.stringify(syncData.sellers));
+          }
+        } catch (syncErr) {
+          console.warn('Could not refresh registered sellers from backend after password reset:', syncErr);
         }
+
+        writeAuditLog(`Password reset successfully saved for Seller partner: ${forgotEmail}`);
+        
+        setLoginEmail(forgotEmail);
+        setForgotEmail('');
+        setNewPassword('');
+        setConfirmNewPassword('');
+        setSellerAuthView('login');
+
+        triggerDialog(
+          "Password Reset Completed! 🔐",
+          "Your account password has been updated. You can now use your new credentials to log in.",
+          "success"
+        );
       } else {
         setOtpError(result.error || 'Failed to save new password. Please try again.');
       }
@@ -1132,46 +1282,70 @@ export default function App() {
 
     const reader = new FileReader();
     reader.onloadend = () => {
-      const base64String = reader.result as string;
-      
+      const base64String = typeof reader.result === 'string' ? reader.result : '';
+      const fallbackAvatar = getAvatarUrl(
+        target === 'owner' && sellerAuthUser ? sellerAuthUser.ownerName || sellerAuthUser.email : (staffUid ? staffUid : 'User'),
+        undefined
+      );
+      const imageToUse = base64String || fallbackAvatar;
+
       if (target === 'owner') {
         if (sellerAuthUser) {
-          const updatedUser = { ...sellerAuthUser, photoUrl: base64String };
+          const updatedUser = { ...sellerAuthUser, photoUrl: imageToUse };
           setSellerAuthUser(updatedUser);
           setCookie('food_persistent_session', JSON.stringify(updatedUser), 30);
           sessionStorage.setItem('cookie_food_session_cookie', JSON.stringify(updatedUser));
 
-          // Sync profile picture to database
           fetch('/api/auth/update-profile-picture', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: sellerAuthUser.email, photoUrl: base64String })
+            body: JSON.stringify({ email: sellerAuthUser.email, photoUrl: imageToUse })
           })
-          .then(res => res.json())
-          .then(data => {
-            if (data.success) {
-              console.log("[Database] Seller profile picture updated in database.");
-            }
-          })
-          .catch(err => console.error("Could not sync profile picture to database:", err));
+            .then(async (res) => {
+              const data = await res.json().catch(() => ({}));
+              if (data.success) {
+                console.log("[Database] Seller profile picture updated in database.");
+              } else {
+                console.warn("Profile picture sync returned non-success:", data);
+              }
+            })
+            .catch(err => console.error("Could not sync profile picture to database:", err));
 
+          if (!disableRemoteSync) void triggerCloudSync(true);
           writeAuditLog("Owner uploaded a custom profile picture");
           showToast("Profile image updated successfully!", "success");
         }
       } else if (target === 'staff' && staffUid) {
         const updated = staff.map(s => {
           if (s.uid === staffUid) {
-            return { ...s, photoUrl: base64String, updatedAt: new Date().toISOString() };
+            return { ...s, photoUrl: imageToUse, updatedAt: new Date().toISOString() };
           }
           return s;
         });
         saveLocalStaff(updated);
         if (currentEmployee && currentEmployee.uid === staffUid) {
-          setCurrentEmployee({ ...currentEmployee, photoUrl: base64String });
+          setCurrentEmployee({ ...currentEmployee, photoUrl: imageToUse });
         }
+        if (!disableRemoteSync) void triggerCloudSync(true);
         writeAuditLog(`Uploaded custom profile picture for Server: ${staffUid}`);
         showToast("Server profile image updated successfully!", "success");
       }
+    };
+    reader.onerror = () => {
+      const fallbackAvatar = getAvatarUrl(
+        target === 'owner' && sellerAuthUser ? sellerAuthUser.ownerName || sellerAuthUser.email : (staffUid ? staffUid : 'User'),
+        undefined
+      );
+      if (target === 'owner' && sellerAuthUser) {
+        const updatedUser = { ...sellerAuthUser, photoUrl: fallbackAvatar };
+        setSellerAuthUser(updatedUser);
+        setCookie('food_persistent_session', JSON.stringify(updatedUser), 30);
+        sessionStorage.setItem('cookie_food_session_cookie', JSON.stringify(updatedUser));
+      } else if (target === 'staff' && staffUid) {
+        const updated = staff.map(s => s.uid === staffUid ? { ...s, photoUrl: fallbackAvatar, updatedAt: new Date().toISOString() } : s);
+        saveLocalStaff(updated);
+      }
+      showToast("Unable to read the selected image, so the default avatar is being used.", "warning");
     };
     reader.readAsDataURL(file);
   };
@@ -1201,8 +1375,59 @@ export default function App() {
   };
 
   const saveLocalOrders = (newOrders: Order[]) => {
-    setOrders(newOrders);
-    localStorage.setItem('food_orders', JSON.stringify(newOrders));
+    const normalizedOrders = newOrders.map((order: any) => ({
+      ...order,
+      orderStatus: order.orderStatus || order.status || 'received',
+      totalAmount: Number(order.totalAmount ?? 0),
+      items: Array.isArray(order.items)
+        ? order.items.map((item: any) => ({
+            ...item,
+            qty: Number(item.qty ?? item.quantity ?? 1),
+            price: Number(item.price ?? 0),
+          }))
+        : [],
+    }));
+
+    setOrders(normalizedOrders as Order[]);
+    localStorage.setItem('food_orders', JSON.stringify(normalizedOrders));
+  };
+
+  const pushIntegrationLog = (entry: { id: string; method: string; url: string; timestamp: string; type: 'request' | 'response'; payload?: string }) => {
+    setSimulatedApiLogs((prev) => [entry, ...prev].slice(0, 50));
+  };
+
+  const notifySellerOfIncomingOrder = (order: any, source: 'poll' | 'event' = 'poll') => {
+    const orderId = order?.id || order?.orderNumber || 'unknown';
+    if (!orderId || processedOrderIdsRef.current.has(orderId)) return;
+
+    processedOrderIdsRef.current.add(orderId);
+
+    const title = source === 'event' ? 'New customer order received' : 'Customer order synced';
+    const body = `${order?.customerName || 'Customer'} placed ${order?.orderNumber || 'a new order'}`;
+
+    setPhoneNotification({ title, body });
+    playOrderChime();
+    showToast(`New order received: ${order?.orderNumber || 'Order'}`, 'success');
+
+    if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+      navigator.vibrate?.([180, 80, 180]);
+    }
+  };
+
+  const notifyCustomerOfStatusChange = (order: any, previousStatus?: string) => {
+    const nextStatus = String(order?.orderStatus || order?.status || 'received').toLowerCase();
+    const prevStatus = String(previousStatus || 'received').toLowerCase();
+    if (!order?.id || nextStatus === prevStatus) return;
+
+    const title = 'Order status updated';
+    const body = `Your order ${order?.orderNumber || ''} is now ${nextStatus}.`;
+
+    setCustomerStatusNotice({ title, body });
+    showToast(body, 'success');
+
+    if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+      navigator.vibrate?.([160, 60, 160]);
+    }
   };
 
   const saveLocalStaff = (newStaffList: StaffMember[]) => {
@@ -1215,102 +1440,66 @@ export default function App() {
     localStorage.setItem('food_logs', JSON.stringify(newLogs));
   };
 
-  // Log action inside Audit Logs locally and set for sync
+  const getLatestClientDataForSync = () => {
+    const localMenu = localStorage.getItem('food_menu');
+    const localStaff = localStorage.getItem('food_staff');
+    const localOrders = localStorage.getItem('food_orders');
+    const localLogs = localStorage.getItem('food_logs');
+
+    return {
+      menuItems: localMenu ? JSON.parse(localMenu) : menuItems,
+      staff: localStaff ? JSON.parse(localStaff) : staff,
+      orders: localOrders ? JSON.parse(localOrders) : orders,
+      auditLogs: localLogs ? JSON.parse(localLogs) : auditLogs,
+    };
+  };
+
+  // Log action inside Audit Logs locally and persist to the backend for MySQL storage
   const writeAuditLog = (action: string) => {
-    if (!currentEmployee) return;
+const actorName = currentEmployee?.name || sellerAuthUser?.ownerName || 'System';
+    const actorRole = currentEmployee?.role || sellerAuthUser?.role || 'Manager/Owner';
+
     const newLog: AuditLog = {
       id: crypto.randomUUID(),
-      employeeName: currentEmployee.name,
-      role: currentEmployee.role,
+      employeeName: actorName,
+      role: actorRole,
       action,
       timestamp: new Date().toISOString(),
     };
-    const updated = [newLog, ...auditLogs];
-    saveLocalLogs(updated);
+
+    setAuditLogs((prev) => {
+      const updated = [newLog, ...prev];
+      localStorage.setItem('food_logs', JSON.stringify(updated));
+      return updated;
+    });
+
+    void fetch('/api/audit-logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newLog),
+    }).catch((error) => {
+      console.warn('Unable to persist audit log to backend:', error);
+    });
   };
 
-  // Google Login flow (Owner Authenticating DB Sync capabilities)
-  const handleGoogleLogin = async () => {
-    try {
-      setSyncStatus('syncing');
-      const result = await signInWithPopup(auth, googleAuthProvider);
-      if (result.user) {
-        setGoogleUser(result.user);
-        const token = await result.user.getIdToken();
-        const response = await fetch('/api/register', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
-          }
-        });
-        if (response.ok) {
-          setDbRegistered(true);
-          triggerCloudSync(result.user);
-          writeAuditLog("Google Account integrated for Cloud Synchronizations");
-        }
-      }
-    } catch (e: any) {
-      setSyncStatus('error');
-      console.error(e);
-      triggerDialog(
-        "Authentication Notice",
-        "Firebase Sign-in Popup blocked or connection lost. Working in persistent local mode.",
-        "warning"
-      );
-    }
-  };
-
-  const handleGoogleLogout = async () => {
-    try {
-      await signOut(auth);
-      setGoogleUser(null);
-      setDbRegistered(false);
-      setSyncStatus('idle');
-      writeAuditLog("Google Account disconnected from POS Cloud.");
-    } catch (e) {
-      console.error(e);
-    }
-  };
 
   // Local Database Synchronizer (Bi-directional comparison with local device MySQL database)
-  const triggerCloudSync = async (usrToUse: FirebaseUser | null = googleUser, silent: boolean = false) => {
-    const userToAuth = usrToUse || auth.currentUser;
-
+  const triggerCloudSync = async (silent: boolean = false) => {
     if (!silent) setSyncStatus('syncing');
     try {
-      let response;
-      if (userToAuth) {
-        const token = await userToAuth.getIdToken();
-        // Prepare local copies to push to local device MySQL
-        response = await fetch('/api/sync', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
-          },
-          body: JSON.stringify({
-            clientMenuItems: menuItems,
-            clientStaff: staff,
-            clientOrders: orders,
-            clientAuditLogs: auditLogs,
-          })
-        });
-      } else {
-        // Local database sync for local/PIN-based/anonymous sessions with local device MySQL database
-        response = await fetch('/api/public/sync', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            clientMenuItems: menuItems,
-            clientStaff: staff,
-            clientOrders: orders,
-            clientAuditLogs: auditLogs,
-          })
-        });
-      }
+      const latestData = getLatestClientDataForSync();
+      const response = await fetch('/api/public/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          clientMenuItems: latestData.menuItems,
+          clientStaff: latestData.staff,
+          clientOrders: latestData.orders,
+          clientAuditLogs: latestData.auditLogs,
+        })
+      });
 
       if (!response.ok) {
         throw new Error("Local server responded with failure");
@@ -1322,11 +1511,13 @@ export default function App() {
         const existingOrderIds = new Set(currentLocalOrders.map((o: any) => o.id));
         const hasNewOrders = backendData.orders.some((o: any) => !existingOrderIds.has(o.id));
 
-        // Overwrite local tables with backend consolidated tables
         saveLocalMenu(backendData.menuItems);
         saveLocalStaff(backendData.staff);
         saveLocalOrders(backendData.orders);
         saveLocalLogs(backendData.auditLogs);
+
+        // Ensure live queue state reflects the most up-to-date backend order list
+        if (!disableRemoteSync) await pullOrdersFromBackend(true);
 
         if (hasNewOrders && currentLocalOrders.length > 0) {
           playOrderChime();
@@ -1348,6 +1539,150 @@ export default function App() {
       }
     }
   };
+
+  // Pull latest orders directly from the backend orders endpoint to ensure live queue updates
+  const pullOrdersFromBackend = async (silent: boolean = false): Promise<Order[]> => {
+    const requestId = `fetch-${Date.now()}`;
+    const requestLog = {
+      id: requestId,
+      method: 'GET',
+      url: '/api/public/orders',
+      timestamp: new Date().toLocaleTimeString(),
+      type: 'request' as const,
+      payload: 'Fetching latest orders from seller backend...'
+    };
+    pushIntegrationLog(requestLog);
+
+    try {
+      const remoteData = await fetchOrdersFromRemoteApi();
+      if (remoteData) {
+        const responseText = JSON.stringify(remoteData);
+        let data: any = {};
+        try {
+          data = responseText ? JSON.parse(responseText) : {};
+        } catch {
+          data = { raw: responseText };
+        }
+
+        pushIntegrationLog({
+          id: `${requestId}-res`,
+          method: 'GET',
+          url: `${getOrderApiBaseUrl()}api/public/orders`,
+          timestamp: new Date().toLocaleTimeString(),
+          type: 'response',
+          payload: JSON.stringify(data, null, 2)
+        });
+
+        if (!data || !Array.isArray(data.orders)) {
+          throw new Error('Backend order list response contained invalid data');
+        }
+
+        const nextOrders = data.orders
+          .map((order: any) => ({
+            ...order,
+            orderStatus: order.orderStatus || order.status || 'received',
+          }))
+          .sort((a: any, b: any) => {
+            const aTime = new Date(a.createdAt || 0).getTime();
+            const bTime = new Date(b.createdAt || 0).getTime();
+            return bTime - aTime;
+          });
+
+        const currentOrderIds = new Set((JSON.parse(localStorage.getItem('food_orders') || '[]') as any[]).map((order: any) => order.id));
+        const newlySeenOrders = nextOrders.filter((order: any) => !currentOrderIds.has(order.id));
+
+        saveLocalOrders(nextOrders);
+
+        if (!silent && newlySeenOrders.length > 0) {
+          showToast(`Live orders queue refreshed with ${newlySeenOrders.length} new order(s).`, 'success');
+        }
+
+        newlySeenOrders.forEach((order: any) => notifySellerOfIncomingOrder(order, 'poll'));
+        console.log('[Integration] Fetched latest orders from backend:', data.orders);
+
+        if (!silent) {
+          showToast('Live orders queue refreshed from backend.', 'success');
+        }
+
+        return nextOrders as Order[];
+      }
+
+      const fallbackResponse = await fetch('/api/public/orders', {
+        method: 'GET',
+        cache: 'no-store',
+        headers: {
+          'Accept': 'application/json'
+        }
+      });
+
+      const responseText = await fallbackResponse.text();
+      let data: any = {};
+      try {
+        data = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        data = { raw: responseText };
+      }
+
+      pushIntegrationLog({
+        id: `${requestId}-res`,
+        method: 'GET',
+        url: '/api/public/orders',
+        timestamp: new Date().toLocaleTimeString(),
+        type: 'response',
+        payload: JSON.stringify(data, null, 2)
+      });
+
+      if (!fallbackResponse.ok) {
+        throw new Error(`Backend order list fetch failed: ${fallbackResponse.status}`);
+      }
+
+      if (!data || !Array.isArray(data.orders)) {
+        throw new Error('Backend order list response contained invalid data');
+      }
+
+      const nextOrders = data.orders
+        .map((order: any) => ({
+          ...order,
+          orderStatus: order.orderStatus || order.status || 'received',
+        }))
+        .sort((a: any, b: any) => {
+          const aTime = new Date(a.createdAt || 0).getTime();
+          const bTime = new Date(b.createdAt || 0).getTime();
+          return bTime - aTime;
+        });
+
+      const currentOrderIds = new Set((JSON.parse(localStorage.getItem('food_orders') || '[]') as any[]).map((order: any) => order.id));
+      const newlySeenOrders = nextOrders.filter((order: any) => !currentOrderIds.has(order.id));
+
+      saveLocalOrders(nextOrders);
+
+      if (!silent && newlySeenOrders.length > 0) {
+        showToast(`Live orders queue refreshed with ${newlySeenOrders.length} new order(s).`, 'success');
+      }
+
+      newlySeenOrders.forEach((order: any) => notifySellerOfIncomingOrder(order, 'poll'));
+      console.log('[Integration] Fetched latest orders from backend:', data.orders);
+
+      if (!silent) {
+        showToast('Live orders queue refreshed from backend.', 'success');
+      }
+
+      return nextOrders as Order[];
+    } catch (err) {
+      console.warn('[Live Orders] Failed to refresh orders from backend:', err);
+      if (!silent) {
+        showToast('Unable to refresh live orders from backend.', 'warning');
+      }
+      return [];
+    }
+  };
+
+  useEffect(() => {
+    if (!sellerAuthUser) return;
+    if (!disableRemoteSync) {
+      void pullOrdersFromBackend(true);
+    }
+  }, [sellerAuthUser, activeTab]);
 
   // Main Database Cloud Synchronizer (Triggered via the Sync button when main server API is online)
   const triggerMainDatabaseSync = async () => {
@@ -1382,16 +1717,11 @@ export default function App() {
 
       // Step B: Post the local device MySQL database data to the Main Server API for synchronization
       const mainServerUrl = getMainServerApiUrl();
-      const token = googleUser ? await googleUser.getIdToken() : null;
-      
       const headers: Record<string, string> = {
         'Content-Type': 'application/json'
       };
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
 
-      const mainSyncUrl = token ? `${mainServerUrl}api/sync` : `${mainServerUrl}api/public/sync`;
+      const mainSyncUrl = `${mainServerUrl}api/public/sync`;
 
       console.log(`[Main Sync] Dispatching local data to main server: ${mainSyncUrl}`);
       const mainResponse = await fetch(mainSyncUrl, {
@@ -1467,8 +1797,7 @@ export default function App() {
   };
 
   // Background Synchronization Manager to replay offline operations
-  const syncQueuedOperations = async (usrToUse: FirebaseUser | null = googleUser, silent: boolean = false) => {
-    const userToAuth = usrToUse || auth.currentUser;
+  const syncQueuedOperations = async (silent: boolean = false) => {
     await updateQueueCount();
     if (!navigator.onLine) return;
 
@@ -1479,26 +1808,13 @@ export default function App() {
       if (!silent) setSyncStatus('syncing');
       console.log(`[SyncManager] Pushing ${queue.length} offline operations to database...`);
 
-      let response;
-      if (userToAuth) {
-        const token = await userToAuth.getIdToken();
-        response = await fetch('/api/sync/operations', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
-          },
-          body: JSON.stringify({ operations: queue })
-        });
-      } else {
-        response = await fetch('/api/public/sync/operations', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ operations: queue })
-        });
-      }
+      const response = await fetch('/api/public/sync/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ operations: queue })
+      });
 
       if (!response.ok) {
         throw new Error("Failed to sync operations");
@@ -1516,7 +1832,7 @@ export default function App() {
         await updateQueueCount();
 
         // Trigger a fresh cloud sync to pull down clean server data
-        await triggerCloudSync(userToAuth, true);
+        if (!disableRemoteSync) await triggerCloudSync(true);
 
         if (!silent) {
           showToast(`Offline queue successfully synced: ${queue.length} updates applied!`, "success");
@@ -1531,8 +1847,8 @@ export default function App() {
   const triggerImmediateDatabaseSync = () => {
     setTimeout(async () => {
       try {
-        await syncQueuedOperations(googleUser, true);
-        await triggerCloudSync(googleUser, true);
+        await syncQueuedOperations(true);
+        if (!disableRemoteSync) await triggerCloudSync(true);
       } catch (err) {
         console.error("Immediate sync failed:", err);
       }
@@ -1761,7 +2077,7 @@ export default function App() {
   };
 
   // Live Queues status modification workflows
-  const advanceOrderStatus = (orderId: string, currentStatus: Order['orderStatus']) => {
+  const advanceOrderStatus = async (orderId: string, currentStatus: Order['orderStatus']) => {
     let nextStatus: Order['orderStatus'] = currentStatus;
     if (currentStatus === 'received') nextStatus = 'preparing';
     else if (currentStatus === 'preparing') nextStatus = 'ready';
@@ -1807,13 +2123,25 @@ export default function App() {
     const updatedOrder = updated.find(ord => ord.id === orderId);
     if (updatedOrder) {
       SyncQueueService.enqueue('UPDATE_ORDER', updatedOrder);
+      try {
+        const response = await fetch(`/api/public/orders/${updatedOrder.id}/status`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: nextStatus, actionBy: currentEmployee?.name || 'Seller Portal' })
+        });
+        if (!response.ok) {
+          console.warn('[Integration] Failed to persist order status update to backend');
+        }
+      } catch (err) {
+        console.warn('[Integration] Error syncing order status to backend:', err);
+      }
     }
     updateQueueCount();
     triggerImmediateDatabaseSync();
     writeAuditLog(`Updated Order Status to [${nextStatus.toUpperCase()}] for #${orders.find(o=>o.id===orderId)?.orderNumber}`);
   };
 
-  const cancelOrderFlow = (orderId: string) => {
+  const cancelOrderFlow = async (orderId: string) => {
     const updated = orders.map(ord => {
       if (ord.id === orderId) {
         return {
@@ -1829,6 +2157,18 @@ export default function App() {
     const updatedOrder = updated.find(ord => ord.id === orderId);
     if (updatedOrder) {
       SyncQueueService.enqueue('UPDATE_ORDER', updatedOrder);
+      try {
+        const response = await fetch(`/api/public/orders/${updatedOrder.id}/status`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'cancelled', actionBy: currentEmployee?.name || 'Seller Portal' })
+        });
+        if (!response.ok) {
+          console.warn('[Integration] Failed to persist cancelled order to backend');
+        }
+      } catch (err) {
+        console.warn('[Integration] Error syncing cancelled order to backend:', err);
+      }
     }
     updateQueueCount();
     triggerImmediateDatabaseSync();
@@ -1951,7 +2291,7 @@ export default function App() {
     if (editingStaff) {
       const updated = staff.map(s => {
         if (s.uid === editingStaff.uid) {
-          return {
+          const updatedStaff = {
             ...s,
             name: staffForm.name,
             pin: staffForm.pin,
@@ -1960,10 +2300,13 @@ export default function App() {
             photoUrl: staffForm.photoUrl || s.photoUrl,
             updatedAt: new Date().toISOString(),
           };
+          SyncQueueService.enqueue('UPDATE_STAFF', updatedStaff);
+          return updatedStaff;
         }
         return s;
       });
       saveLocalStaff(updated);
+      triggerImmediateDatabaseSync();
       writeAuditLog(`Updated profile for Employee: ${staffForm.name}`);
     } else {
       const newEmp: StaffMember = {
@@ -1975,13 +2318,14 @@ export default function App() {
         photoUrl: staffForm.photoUrl,
         updatedAt: new Date().toISOString(),
       };
+      SyncQueueService.enqueue('CREATE_STAFF', newEmp);
       saveLocalStaff([...staff, newEmp]);
+      triggerImmediateDatabaseSync();
       writeAuditLog(`Registered New Employee profile: ${staffForm.name} as ${staffForm.role}`);
     }
 
     setShowStaffModal(false);
     setEditingStaff(null);
-    triggerImmediateDatabaseSync();
     setStaffForm({
       name: '',
       pin: '',
@@ -2020,6 +2364,7 @@ export default function App() {
       "Delete Profile",
       () => {
         const updated = staff.filter(s => s.uid !== uid);
+        SyncQueueService.enqueue('DELETE_STAFF', { uid });
         saveLocalStaff(updated);
         triggerImmediateDatabaseSync();
         writeAuditLog(`Removed Staff Member ${name} credentials`);
@@ -2079,7 +2424,7 @@ export default function App() {
     // Header
     csvContent += "KITCHEN POS - SALES & BUSINESS ANALYTICS REPORT\r\n";
     csvContent += `Generated At,${new Date().toLocaleString()}\r\n`;
-    csvContent += `Generated By,${currentEmployee?.name || googleUser?.email || 'System/POS Terminal'}\r\n\r\n`;
+    csvContent += `Generated By,${currentEmployee?.name || sellerAuthUser?.email || 'System/POS Terminal'}\r\n\r\n`;
     
     // Summary Metrics
     csvContent += "KEY METRICS\r\n";
@@ -2281,7 +2626,7 @@ export default function App() {
           
           <div class="metadata">
             <div><strong>Report Date/Time:</strong> ${new Date().toLocaleString()}</div>
-            <div><strong>Generated By:</strong> ${currentEmployee?.name || googleUser?.email || 'POS Terminal Server'}</div>
+            <div><strong>Generated By:</strong> ${currentEmployee?.name || sellerAuthUser?.email || 'POS Terminal Server'}</div>
           </div>
           
           <div class="metrics-grid">
@@ -2371,7 +2716,7 @@ export default function App() {
   const getFilteredOrders = () => {
     if (orderFilter === 'all') return orders;
     return orders.filter(o => {
-      if (orderFilter === 'pending') return o.orderStatus === 'received' || o.orderStatus === 'preparing' || o.orderStatus === 'ready';
+      if (orderFilter === 'pending') return o.orderStatus === 'pending' || o.orderStatus === 'received' || o.orderStatus === 'preparing' || o.orderStatus === 'ready';
       if (orderFilter === 'completed') return o.orderStatus === 'completed';
       if (orderFilter === 'cancelled') return o.orderStatus === 'cancelled';
       return true;
@@ -2407,11 +2752,11 @@ export default function App() {
                   <LogOut size={24} />
                 </div>
                 <div className="space-y-1.5 flex-1">
-                  <h3 className="font-bold text-base leading-snug">Mag-logout sa Portal?</h3>
+                  <h3 className="font-bold text-base leading-snug">Log out of the Portal?</h3>
                   <p className={`text-xs leading-relaxed ${
                     theme === 'dark' ? 'text-neutral-400' : 'text-neutral-500'
                   }`}>
-                    Sigurado ka bang nais mong lumabas sa iyong account? Anumang hindi na-sync na transaksyon o kasalukuyang ginagawa ay maaaring mawala.
+                    Are you sure you want to sign out? Any unsynced transactions or in-progress work may be lost.
                   </p>
                 </div>
               </div>
@@ -2426,14 +2771,14 @@ export default function App() {
                       : 'bg-neutral-100 hover:bg-neutral-200 text-neutral-700'
                   }`}
                 >
-                  Manatili
+                  Stay signed in
                 </button>
                 <button
                   type="button"
                   onClick={confirmSellerLogout}
                   className="px-5 py-2 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-xl text-xs transition cursor-pointer shadow-lg shadow-rose-600/10"
                 >
-                  Sige, Mag-logout
+                  Yes, log out
                 </button>
               </div>
             </motion.div>
@@ -2476,7 +2821,7 @@ export default function App() {
                   </div>
                   <div>
                     <h3 className="font-bold text-lg">Terms of Service</h3>
-                    <p className="text-[10px] text-neutral-400 font-mono">Huling Update: Hulyo 2026</p>
+                    <p className="text-[10px] text-neutral-400 font-mono">Last Updated: July 2026</p>
                   </div>
                 </div>
                 <button
@@ -2492,30 +2837,30 @@ export default function App() {
               {/* Content */}
               <div className="p-6 overflow-y-auto max-h-[60vh] space-y-4 text-xs leading-relaxed font-sans">
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">1. Pagtanggap sa mga Tuntunin</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">1. Acceptance of Terms</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Sa pamamagitan ng pagrehistro sa aming platform, sumasang-ayon ka na sumunod sa lahat ng nakasaad na tuntunin dito. Kung hindi ka sumasang-ayon, mangyaring huwag magpatuloy sa paggamit ng serbisyong ito.
+                    By registering on our platform, you agree to comply with all terms outlined here. If you do not agree, please do not continue using this service.
                   </p>
                 </section>
 
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">2. Responsibilidad sa Account</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">2. Account Responsibility</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Obligasyon ng may-ari ng tindahan na protektahan ang kanilang password, API credentials, at pamahalaan ang mga profile ng kanilang mga staff. Anumang transaksyon o aksyon na isasagawa sa ilalim ng iyong account ay ituturing na iyong direktang responsibilidad.
+                    It is the store owner's responsibility to protect their password, API credentials, and manage their staff profiles. Any transaction or action performed under your account is considered your direct responsibility.
                   </p>
                 </section>
 
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">3. Transaksyon at Serbisyo</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">3. Transactions and Service</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Ang aming platform ay nagsisilbing system para sa pagproseso ng mga order, imbentaryo, at analytics para sa mga restawran o kainan. Walang pananagutan ang system provider sa mga pagkaantala sa serbisyo sanhi ng pagkawala ng koneksyon sa internet ng kliyente, ngunit mayroon kaming built-in offline synchronization mechanism upang mapangalagaan ang iyong data.
+                    Our platform serves as the system for order processing, inventory, and analytics for restaurants or food businesses. The system provider is not liable for service delays caused by customer internet connectivity loss, but we include offline synchronization to protect your data.
                   </p>
                 </section>
 
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">4. Limitasyon ng Pananagutan</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">4. Limitation of Liability</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Sa pinakamataas na saklaw na pinahihintulutan ng batas, ang platform ay ibinibigay "as is" nang walang anumang garantiya. Hindi kami mananagot para sa anumang hindi direkta o hindi sinasadyang pinsala na magreresulta mula sa maling paggamit ng system.
+                    To the fullest extent permitted by law, the platform is provided "as is" without any warranty. We are not responsible for any indirect or incidental damages resulting from improper use of the system.
                   </p>
                 </section>
               </div>
@@ -2528,7 +2873,7 @@ export default function App() {
                   onClick={() => setShowTermsModal(false)}
                   className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl text-xs transition cursor-pointer"
                 >
-                  Nauunawaan Ko
+                  I Understand
                 </button>
               </div>
             </motion.div>
@@ -2565,7 +2910,7 @@ export default function App() {
                   </div>
                   <div>
                     <h3 className="font-bold text-lg">Privacy Policy</h3>
-                    <p className="text-[10px] text-neutral-400 font-mono">Huling Update: Hulyo 2026</p>
+                    <p className="text-[10px] text-neutral-400 font-mono">Last Updated: July 2026</p>
                   </div>
                 </div>
                 <button
@@ -2581,30 +2926,30 @@ export default function App() {
               {/* Content */}
               <div className="p-6 overflow-y-auto max-h-[60vh] space-y-4 text-xs leading-relaxed font-sans">
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">1. Impormasyong Aming Kinokolekta</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">1. Information We Collect</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Kami ay nakatuon sa pagprotekta sa iyong privacy. Kinokolekta namin ang mga impormasyon tulad ng pangalan ng negosyo, pangalan ng may-ari, email address, numero ng telepono, at impormasyon ng imbentaryo upang maihatid nang maayos ang serbisyo.
+                    We are committed to protecting your privacy. We collect information such as business name, owner name, email address, phone number, and inventory data to deliver the service effectively.
                   </p>
                 </section>
 
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">2. Paano Namin Ginagamit ang Iyong Data</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">2. How We Use Your Data</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Ang mga nakolektang impormasyon ay ginagamit lamang para sa authentication, pagpapanatili ng real-time at offline synchronization ng mga order, at pagbuo ng sales analytics para sa iyong tindahan. Hindi namin ibebenta o ibabahagi ang iyong data sa mga ikatlong partido (third parties) para sa marketing.
+                    Collected information is used only for authentication, maintaining real-time and offline order synchronization, and building sales analytics for your store. We do not sell or share your data with third parties for marketing.
                   </p>
                 </section>
 
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">3. Seguridad ng Data</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">3. Data Security</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Gumagamit kami ng advanced industry-standard encryption, CSRF protection, at secure na session controls upang maiwasan ang hindi awtorisadong pag-access, pagbabago, o pagtagas ng iyong sensitibong impormasyon.
+                    We use advanced industry-standard encryption, CSRF protection, and secure session controls to prevent unauthorized access, modification, or leakage of your sensitive information.
                   </p>
                 </section>
 
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">4. Mga Karapatan ng User</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">4. User Rights</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Alinsunod sa Data Privacy Act, mayroon kang karapatang i-access, baguhin, o hilinging burahin ang iyong personal at tindahang impormasyon sa aming database anumang oras sa pamamagitan ng pag-update ng iyong profile o pakikipag-ugnayan sa amin.
+                    Under the Data Privacy Act, you have the right to access, update, or request deletion of your personal and store-related information in our database at any time by updating your profile or contacting us.
                   </p>
                 </section>
               </div>
@@ -2617,7 +2962,7 @@ export default function App() {
                   onClick={() => setShowPrivacyModal(false)}
                   className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl text-xs transition cursor-pointer"
                 >
-                  Tinatanggap Ko
+                  I Accept
                 </button>
               </div>
             </motion.div>
@@ -2654,7 +2999,7 @@ export default function App() {
                   </div>
                   <div>
                     <h3 className="font-bold text-lg">Cookie Policy</h3>
-                    <p className="text-[10px] text-neutral-400 font-mono">Huling Update: Hulyo 2026</p>
+                    <p className="text-[10px] text-neutral-400 font-mono">Last Updated: July 2026</p>
                   </div>
                 </div>
                 <button
@@ -2670,23 +3015,23 @@ export default function App() {
               {/* Content */}
               <div className="p-6 overflow-y-auto max-h-[60vh] space-y-4 text-xs leading-relaxed font-sans">
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">1. Ano ang mga Cookies at Local Storage?</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">1. What Are Cookies and Local Storage?</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Ang cookies at local storage ay maliliit na text files na sine-save sa iyong browser upang matiyak na maalala ng platform ang iyong mga preferences, estado ng pagka-login, at upang ligtas na magamit ang system.
+                    Cookies and local storage are small text files stored by your browser to remember platform preferences, login state, and to safely run the system.
                   </p>
                 </section>
 
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">2. Paano Namin Sila Ginagamit</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">2. How We Use Them</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Gumagamit kami ng **Essential Cookies** at **Session Storage** upang mapanatili ang iyong secure login session at upang gumana ang aming offline queue service. Ginagamit din namin ang local storage para i-save ang iyong pre-loaded menu lists, active order states, at theme choices nang sa gayon ay hindi mo kailangang i-configure muli ang interface sa tuwing bibisita ka.
+                    We use **Essential Cookies** and **Session Storage** to maintain your secure login session and to operate our offline queue service. We also use local storage to save your pre-loaded menu lists, active order states, and theme choices so you do not need to reconfigure the interface on every visit.
                   </p>
                 </section>
 
                 <section className="space-y-1.5">
-                  <h4 className="font-bold text-sm text-indigo-400">3. Pamamahala sa mga Cookies</h4>
+                  <h4 className="font-bold text-sm text-indigo-400">3. Managing Cookies</h4>
                   <p className={`${theme === 'dark' ? 'text-neutral-300' : 'text-neutral-600'}`}>
-                    Maaari mong piliing huwag tanggapin o i-delete ang cookies sa pamamagitan ng mga settings ng iyong browser. Gayunpaman, paki-tandaan na ang pag-block sa cookies ay maaaring magbunga ng hindi tamang paggana o pagkawala ng kakayahang mag-login sa seller portal.
+                    You may choose not to accept or delete cookies through your browser settings. However, please note that blocking cookies may cause the portal to function incorrectly or prevent you from signing in.
                   </p>
                 </section>
               </div>
@@ -2699,7 +3044,7 @@ export default function App() {
                   onClick={() => setShowCookieModal(false)}
                   className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl text-xs transition cursor-pointer"
                 >
-                  Sumasang-ayon Ako
+                  I Accept
                 </button>
               </div>
             </motion.div>
@@ -3674,7 +4019,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Sync Controls & Firebase Auth */}
+        {/* Sync Controls */}
         <div className="flex flex-wrap items-center gap-3">
           
           {/* Local MySQL Connection status */}
@@ -3718,29 +4063,6 @@ export default function App() {
             <span className="text-xs font-medium">Sync</span>
           </button>
 
-          {/* Google Auth Sync Integration status */}
-          {googleUser ? (
-            <div className={`flex items-center gap-2 border rounded-xl pl-3 pr-2 py-1.5 text-xs font-mono transition-colors ${
-              theme === 'dark' ? 'bg-indigo-950/30 border-indigo-900/50' : 'bg-indigo-50 border-indigo-200'
-            }`}>
-              <Database size={13} className="text-indigo-500" />
-              <span className="truncate max-w-[120px] text-indigo-400 font-medium">Backup Enabled</span>
-              <button 
-                onClick={handleGoogleLogout}
-                className="hover:text-rose-500 transition-colors ml-1 border-l pl-2 text-[10px] border-neutral-500/20 uppercase"
-              >
-                Disconnect
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={handleGoogleLogin}
-              className="flex items-center gap-2 px-3 py-1.5 text-xs font-mono text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl transition shadow active:scale-95 text-nowrap"
-            >
-              <Database size={13} />
-              Google Login (Sync)
-            </button>
-          )}
 
           {/* Terminal Fast Switch Employee Account Trigger & Profile Dropdown */}
           <div className="relative">
@@ -4183,8 +4505,8 @@ export default function App() {
                                   <span className="flex items-center gap-1 text-amber-500"><Utensils size={8} /> KITCHEN PORTAL</span>
                                   <span>now</span>
                                 </div>
-                                <h4 className="text-[10px] font-extrabold text-white">{phoneNotification.title}</h4>
-                                <p className="text-[9px] text-neutral-400 mt-0.5 leading-tight">{phoneNotification.body}</p>
+                                <h4 className="text-[10px] font-extrabold text-white">{phoneNotification?.title}</h4>
+                                <p className="text-[9px] text-neutral-400 mt-0.5 leading-tight">{phoneNotification?.body}</p>
                               </div>
                             ) : lastSimulatedOrder ? (
                               <div className="bg-neutral-900/85 p-3 rounded-xl border border-neutral-800/80 shadow-md backdrop-blur-md text-left">
@@ -4251,8 +4573,8 @@ export default function App() {
                                   <span className="text-amber-400 font-black">KITCHEN</span>
                                   <span>now</span>
                                 </div>
-                                <p className="text-[10px] font-extrabold text-white truncate">{phoneNotification.title}</p>
-                                <p className="text-[8.5px] text-neutral-400 truncate leading-tight">{phoneNotification.body}</p>
+                                <p className="text-[10px] font-extrabold text-white truncate">{phoneNotification?.title}</p>
+                                <p className="text-[8.5px] text-neutral-400 truncate leading-tight">{phoneNotification?.body}</p>
                               </div>
                             </div>
                           )}
@@ -4869,92 +5191,119 @@ export default function App() {
                                 const reqId = Math.random().toString(36).substring(7);
                                 
                                 const requestPayload = {
-                                  customerName: custName,
-                                  customerPhone: custPhone,
-                                  deliveryAddress: custAddress,
-                                  items: customerCart.map(c => ({ 
-                                    id: c.id, 
-                                    name: c.name, 
-                                    qty: c.qty, 
-                                    price: Number(c.price),
+                                  customerName: custName.trim(),
+                                  customerPhone: custPhone.trim(),
+                                  deliveryAddress: custAddress.trim(),
+                                  items: customerCart.map(c => ({
+                                    id: c.id,
+                                    productId: c.id,
+                                    name: c.name,
+                                    qty: Number(c.qty || 1),
+                                    quantity: Number(c.qty || 1),
+                                    price: Number(c.price || 0),
+                                    unitPrice: Number(c.price || 0),
+                                    lineTotal: Number(c.price || 0) * Number(c.qty || 1),
                                     allergies: c.allergies || undefined,
                                     allergyAction: c.allergyAction || undefined,
-                                    allergyDetails: c.allergyDetails || undefined
+                                    allergyDetails: c.allergyDetails || undefined,
                                   })),
-                                  paymentMethod: custPayment
+                                  paymentMethod: custPayment,
+                                  paymentStatus: 'unpaid',
+                                  orderStatus: 'received',
                                 };
 
-                                // 1. Log request payload
-                                setSimulatedApiLogs(prev => [
-                                  {
-                                    id: reqId,
-                                    method: 'POST',
-                                    url: `/api/public/orders`,
-                                    timestamp: new Date().toLocaleTimeString(),
-                                    type: 'request',
-                                    payload: JSON.stringify(requestPayload, null, 2)
-                                  },
-                                  ...prev
-                                ]);
+                                pushIntegrationLog({
+                                  id: reqId,
+                                  method: 'POST',
+                                  url: '/api/public/orders',
+                                  timestamp: new Date().toLocaleTimeString(),
+                                  type: 'request',
+                                  payload: JSON.stringify(requestPayload, null, 2)
+                                });
 
                                 try {
-                                  // 2. Perform live REST API Post Request to our server.ts
-                                  const response = await fetch('/api/public/orders', {
+                                  const apiBaseUrl = getOrderApiBaseUrl();
+                                  const candidatePaths = [
+                                    '/api/public/orders',
+                                    '/api/orders',
+                                    '/orders',
+                                  ];
+                                  let response: Response | null = null;
+                                  let remoteResponseText = '';
+                                  let remoteResponseData: any = {};
+
+                                  for (const path of candidatePaths) {
+                                    try {
+                                      response = await fetch(`${apiBaseUrl.replace(/\/$/, '')}${path}`, {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify(requestPayload)
+                                      });
+                                      remoteResponseText = await response.text();
+                                      try {
+                                        remoteResponseData = remoteResponseText ? JSON.parse(remoteResponseText) : {};
+                                      } catch {
+                                        remoteResponseData = { raw: remoteResponseText };
+                                      }
+                                      if (response.ok && remoteResponseData?.success) {
+                                        break;
+                                      }
+                                    } catch {
+                                      response = null;
+                                    }
+                                  }
+
+                                  if (!response) {
+                                    throw new Error('No remote order endpoint responded successfully');
+                                  }
+
+                                  if (!response.ok || !remoteResponseData?.success) {
+                                    throw new Error(remoteResponseData.error || remoteResponseData.message || 'Failed');
+                                  }
+
+                                  pushIntegrationLog({
+                                    id: reqId + '-res',
                                     method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify(requestPayload)
+                                    url: '/api/public/orders',
+                                    timestamp: new Date().toLocaleTimeString(),
+                                    type: 'response',
+                                    payload: JSON.stringify(remoteResponseData, null, 2)
                                   });
 
-                                  const responseData = await response.json();
+                                  console.log('[Integration] POST /api/public/orders response:', remoteResponseData);
 
-                                  if (responseData.success) {
-                                    // 3. Log success response payload
-                                    setSimulatedApiLogs(prev => [
-                                      {
-                                        id: reqId + '-res',
-                                        method: 'POST',
-                                        url: `/api/public/orders`,
-                                        timestamp: new Date().toLocaleTimeString(),
-                                        type: 'response',
-                                        payload: JSON.stringify(responseData, null, 2)
-                                      },
-                                      ...prev
-                                    ]);
-
+                                  if (response.ok && remoteResponseData.success) {
                                     const createdOrder: Order = {
-                                      id: responseData.order.id,
-                                      orderNumber: responseData.order.orderNumber,
-                                      customerName: responseData.order.customerName,
-                                      customerPhone: responseData.order.customerPhone,
-                                      deliveryAddress: responseData.order.deliveryAddress,
-                                      items: responseData.order.items,
-                                      totalAmount: responseData.order.totalAmount,
-                                      paymentStatus: responseData.order.paymentStatus as any,
-                                      paymentMethod: responseData.order.paymentMethod as any,
-                                      orderStatus: responseData.order.orderStatus as any,
-                                      actionBy: responseData.order.actionBy,
-                                      stockReduced: responseData.order.stockReduced,
-                                      createdAt: responseData.order.createdAt,
-                                      updatedAt: responseData.order.updatedAt,
+                                      id: remoteResponseData.order.id,
+                                      orderNumber: remoteResponseData.order.orderNumber,
+                                      customerName: remoteResponseData.order.customerName,
+                                      customerPhone: remoteResponseData.order.customerPhone,
+                                      deliveryAddress: remoteResponseData.order.deliveryAddress,
+                                      items: remoteResponseData.order.items,
+                                      totalAmount: remoteResponseData.order.totalAmount,
+                                      paymentStatus: remoteResponseData.order.paymentStatus as any,
+                                      paymentMethod: remoteResponseData.order.paymentMethod as any,
+                                      orderStatus: (remoteResponseData.order.orderStatus || remoteResponseData.order.status) as any,
+                                      actionBy: remoteResponseData.order.actionBy,
+                                      stockReduced: remoteResponseData.order.stockReduced,
+                                      createdAt: remoteResponseData.order.createdAt,
+                                      updatedAt: remoteResponseData.order.updatedAt,
                                     };
 
-                                    // Push directly to live queue local state too!
                                     const updatedOrders = [createdOrder, ...orders];
-                                    setOrders(updatedOrders);
-                                    localStorage.setItem('food_orders', JSON.stringify(updatedOrders));
-
-                                    // Trigger sound notifier
-                                    playOrderChime();
+                                    saveLocalOrders(updatedOrders);
+                                    if (!disableRemoteSync) await pullOrdersFromBackend(true);
+                                    notifySellerOfIncomingOrder(createdOrder, 'event');
                                     
                                     setLastSimulatedOrder(createdOrder);
                                     writeAuditLog(`Online Customer [${custName}] placed Order ${createdOrder.orderNumber} via API`);
                                     setCustomerView('success');
                                   } else {
-                                    throw new Error(responseData.error || "Failed");
+                                    throw new Error(remoteResponseData.error || remoteResponseData.message || 'Failed');
                                   }
                                 } catch (err: any) {
-                                  console.error("Simulation request error:", err);
-                                  showToast("API error: " + (err.message || "Request failed"), "error");
+                                  console.error('[Integration] Simulation request error:', err);
+                                  showToast('API error: ' + (err.message || 'Request failed'), 'error');
                                 }
                               }}
                               className="w-full py-2.5 bg-amber-500 hover:bg-amber-600 text-black rounded-xl text-xs font-black uppercase tracking-widest shadow-md transition-all active:scale-95 cursor-pointer"
@@ -4978,10 +5327,18 @@ export default function App() {
                             </p>
                           </div>
 
+                          {customerStatusNotice && (
+                            <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-2.5 text-left">
+                              <p className="text-[10px] font-black uppercase text-amber-400">{customerStatusNotice?.title || 'Order update'}</p>
+                              <p className="text-[10px] text-neutral-300 mt-1">{customerStatusNotice?.body || 'Your order status has been updated.'}</p>
+                            </div>
+                          )}
+
                           <div className="bg-neutral-850 p-3 rounded-xl border border-neutral-800 text-left space-y-1 text-[10px] font-mono">
                             <p className="text-neutral-400">Order Ref: <span className="text-white font-bold">{lastSimulatedOrder?.orderNumber}</span></p>
                             <p className="text-neutral-400">Total Charged: <span className="text-amber-400 font-bold">₱{parseFloat(lastSimulatedOrder?.totalAmount || '0').toFixed(2)}</span></p>
                             <p className="text-neutral-400">Payment: <span className="text-white uppercase">{lastSimulatedOrder?.paymentMethod} ({lastSimulatedOrder?.paymentStatus})</span></p>
+                            <p className="text-neutral-400">Status: <span className="text-white uppercase">{lastSimulatedOrder?.orderStatus}</span></p>
                           </div>
 
                           <div className="text-[10px] text-amber-400 bg-amber-500/10 p-2.5 rounded-xl border border-amber-500/20 text-center">
@@ -4995,6 +5352,7 @@ export default function App() {
                               setCustName('');
                               setCustPhone('');
                               setCustAddress('');
+                              setCustomerStatusNotice(null);
                               setCustomerView('products');
                             }}
                             className="text-xs text-white font-semibold bg-neutral-800 hover:bg-neutral-700 px-4 py-2 rounded-lg cursor-pointer inline-block"
@@ -5578,7 +5936,7 @@ export default function App() {
               <div className="space-y-4">
                 {displayOrders.map(order => {
                   const itemsSummary = order.items.map(itm => `${itm.name} (x${itm.qty})`).join(', ');
-                  const isPending = order.orderStatus === 'received' || order.orderStatus === 'preparing' || order.orderStatus === 'ready';
+                  const isPending = order.orderStatus === 'pending' || order.orderStatus === 'received' || order.orderStatus === 'preparing' || order.orderStatus === 'ready';
 
                   return (
                     <div 
@@ -5593,6 +5951,7 @@ export default function App() {
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="font-bold text-sm text-indigo-400">{order.orderNumber}</span>
                           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase ${
+                            order.orderStatus === 'pending' ? 'bg-slate-500/20 text-slate-300' :
                             order.orderStatus === 'received' ? 'bg-indigo-500/20 text-indigo-400' :
                             order.orderStatus === 'preparing' ? 'bg-amber-500/20 text-amber-400' :
                             order.orderStatus === 'ready' ? 'bg-emerald-500/20 text-emerald-400' :
@@ -5724,6 +6083,7 @@ export default function App() {
                       price: '',
                       inventoryQty: '',
                       sku: '',
+                      image: '',
                     });
                     setShowMenuModal(true);
                   }}
@@ -5839,6 +6199,7 @@ export default function App() {
                         pin: '',
                         role: 'Staff',
                         status: 'active',
+                        photoUrl: '',
                       });
                       setShowStaffModal(true);
                     }}

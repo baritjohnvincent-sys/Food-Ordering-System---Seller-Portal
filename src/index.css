@@ -32,12 +32,14 @@
 }
 
 /* Firefox Support */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(99, 102, 241, 0.2) transparent;
-}
+@supports (scrollbar-color: rgba(99, 102, 241, 0.2) transparent) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(99, 102, 241, 0.2) transparent;
+  }
 
-.dark * {
-  scrollbar-color: rgba(129, 140, 248, 0.25) transparent;
+  .dark * {
+    scrollbar-color: rgba(129, 140, 248, 0.25) transparent;
+  }
 }
 

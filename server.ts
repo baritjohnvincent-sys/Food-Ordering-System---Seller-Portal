@@ -1,24 +1,149 @@
+import dotenv from "dotenv";
+dotenv.config();
+
 import express from "express";
 import path from "path";
 import crypto from "crypto";
 import nodemailer from "nodemailer";
+import * as jwt from "jsonwebtoken";
 import { createServer as createViteServer } from "vite";
-import { db } from "./src/db/index.ts";
-import { menuItems, orders, staff, users, auditLogs, sellers } from "./src/db/schema.ts";
 import { eq } from "drizzle-orm";
-import { requireAuth, AuthRequest } from "./src/middleware/auth.ts";
+import { db } from "./src/db/index.ts";
+import { auditLogs, menuItems, orders, staff, users } from "./src/db/schema.ts";
+
+const app = express();
+const PORT = Number(process.env.PORT || 5000);
+const SELLER_API_TOKEN = process.env.SELLER_API_TOKEN?.trim() || '';
+const VITE_SELLER_API_TOKEN = process.env.VITE_SELLER_API_TOKEN?.trim() || '';
+const SELLER_TOKEN_SECRET = process.env.SELLER_TOKEN_SECRET?.trim() || process.env.JWT_SECRET?.trim() || 'your-seller-secret';
+const ACCEPTED_SELLER_TOKENS = new Set<string>([
+  ...(SELLER_API_TOKEN ? [SELLER_API_TOKEN] : []),
+  ...(VITE_SELLER_API_TOKEN ? [VITE_SELLER_API_TOKEN] : []),
+]);
+
+interface SellerAuthRequest extends express.Request {
+  seller?: { id: number; email: string; role?: string };
+}
+
+const requireSellerAuth = async (
+  req: SellerAuthRequest,
+  res: express.Response,
+  next: express.NextFunction
+) => {
+  const authHeader = String(req.headers.authorization || '');
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const sellerEmailHeader = String(req.headers['x-seller-email'] || req.headers['x-user-email'] || '').trim().toLowerCase();
+
+  let validatedToken = false;
+  let tokenPayload: any = null;
+
+  if (ACCEPTED_SELLER_TOKENS.has(token)) {
+    validatedToken = true;
+  } else if (token && token.split('.').length === 3) {
+    try {
+      tokenPayload = jwt.verify(token, SELLER_TOKEN_SECRET);
+      validatedToken = true;
+    } catch (error) {
+      console.warn('[Seller Auth] JWT verification failed:', error);
+    }
+  }
+
+  if (!validatedToken) {
+    return res.status(401).json({ success: false, message: 'Unauthorized' });
+  }
+
+  const verifiedEmail = sellerEmailHeader || String(tokenPayload?.email || '').trim().toLowerCase();
+  if (!verifiedEmail) {
+    return res.status(401).json({ success: false, message: 'Missing seller email header or JWT email claim' });
+  }
+
+  try {
+    let sellerRecord: any = null;
+    const usersByEmail = await db.select().from(users).where(eq(users.email, sellerEmailHeader));
+    sellerRecord = usersByEmail[0] || null;
+
+    if (!sellerRecord) {
+      const staffByEmail = await db.select().from(staff).where(eq(staff.email, sellerEmailHeader));
+      sellerRecord = staffByEmail[0] || null;
+    }
+
+    if (!sellerRecord || !sellerRecord.sellerId) {
+      return res.status(403).json({ success: false, message: 'Seller account not found or not authorized' });
+    }
+
+    req.seller = {
+      id: Number(sellerRecord.sellerId),
+      email: sellerEmailHeader,
+      role: sellerRecord.role || 'Seller',
+    };
+    next();
+  } catch (error: any) {
+    console.error('[Seller Auth] Error validating seller auth:', error);
+    return res.status(500).json({ success: false, message: 'Seller authentication failed' });
+  }
+};
 
 async function startServer() {
-  const app = express();
-  const PORT = 3000;
+  const listenOnPort = (port: number) => {
+    const server = app.listen(port, "0.0.0.0", () => {
+      console.log(`Express server fully functional. Online at port ${port}`);
+    });
+
+    server.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRINUSE") {
+        const nextPort = port + 1;
+        console.warn(`[Server] Port ${port} is busy, trying ${nextPort}...`);
+        server.close(() => {
+          listenOnPort(nextPort);
+        });
+      } else {
+        console.error("[Server] Failed to start server:", err);
+        process.exit(1);
+      }
+    });
+  };
 
   // Custom CORS middleware to support Customer and Admin modules calling from other origins
+  // CORS middleware: echo origin when present and allow credentials.
+  // Configure allowed origins via CORS_ALLOWED_ORIGINS (comma-separated). If empty, allow any origin but disable credentials.
+  const allowedOriginsEnv = process.env.CORS_ALLOWED_ORIGINS || '';
+  const allowedOrigins = allowedOriginsEnv.split(',').map(s => s.trim()).filter(Boolean);
+
   app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    if (req.method === "OPTIONS") {
+    const origin = (req.headers.origin as string) || '';
+
+    if (origin) {
+      const isLocalOrigin = origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1');
+      // If allowedOrigins is empty, accept any origin; otherwise accept listed origins or local dev origins.
+      if (allowedOrigins.length === 0 || allowedOrigins.includes(origin) || isLocalOrigin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
+    } else {
+      // No Origin header (server-to-server or same-origin requests)
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Credentials', 'false');
+    }
+
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, X-Seller-Email, x-seller-email, x-service-secret, X-Requested-With, Accept'
+    );
+
+    if (req.method === 'OPTIONS') {
       return res.sendStatus(200);
+    }
+
+    next();
+  });
+
+  // Normalize duplicate slashes in incoming request URLs to support malformed customer integrations like //api/orders
+  app.use((req, res, next) => {
+    if (req.url.includes('//')) {
+      const normalizedUrl = req.url.replace(/\/\/+/, '/');
+      console.log('[Server] Normalizing malformed request URL from', req.url, 'to', normalizedUrl);
+      req.url = normalizedUrl;
     }
     next();
   });
@@ -26,21 +151,18 @@ async function startServer() {
   // Body parser limit increased to handle larger offline sales logs
   app.use(express.json({ limit: "15mb" }));
 
-  // API Check endpoint
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", serverTime: new Date().toISOString() });
-  });
-
   // =============================================================
   // GMAIL SMTP MAIL TRANSPORT SERVICE
   // =============================================================
   const getTransporter = () => {
-    const user = process.env.GMAIL_USER;
-    const pass = process.env.GMAIL_APP_PASSWORD;
+    const user = process.env.GMAIL_USER?.trim();
+    const pass = (process.env.GMAIL_APP_PASSWORD || process.env.GMAIL_PASS || process.env.GMAIL_PASSWORD || "").trim().replace(/\s+/g, "");
+
     if (!user || !pass) {
       console.warn("⚠️ [SMTP] GMAIL_USER and GMAIL_APP_PASSWORD environment variables are not set. Gmail SMTP is disabled.");
       return null;
     }
+
     return nodemailer.createTransport({
       service: 'gmail',
       auth: {
@@ -86,6 +208,7 @@ async function startServer() {
     phone: string;
     password: string;
     role: string;
+    pin: string;
   }>();
   const forgotPasswordStore = new Map<string, {
     otp: string;
@@ -130,12 +253,7 @@ async function startServer() {
 
       const emailSent = await sendSystemEmail(emailLower, subject, body);
 
-      res.json({ 
-        success: true, 
-        previewUrl: "",
-        isFallback: !emailSent,
-        localBypassOtp: otp
-      });
+      res.json({ success: true });
     } catch (error: any) {
       console.error("[Security Engine] Error generating OTP:", error);
       res.status(500).json({ error: "Failed to generate security code" });
@@ -170,7 +288,7 @@ async function startServer() {
 
   // 3. REGISTRATION FLOW - Initialize Verification
   app.post("/api/auth/register-init", async (req, res) => {
-    const { email, phone, businessName, ownerName, password, role } = req.body;
+    const { email, phone, businessName, ownerName, password, role, pin } = req.body;
     if (!email || !phone || !businessName || !ownerName || !password) {
       return res.status(400).json({ error: "All registration fields are required" });
     }
@@ -201,7 +319,8 @@ async function startServer() {
       ownerName,
       phone,
       password,
-      role: role || 'Manager/Owner'
+      role: role || 'Manager/Owner',
+      pin: pin || '1234'
     });
 
     const host = req.get("host") || "localhost:3000";
@@ -245,8 +364,6 @@ async function startServer() {
       res.json({
         success: true,
         email: emailLower,
-        localBypassLink: !emailSent ? verificationLink : null,
-        localBypassOtp: !emailSent ? otp : null
       });
     } catch (err: any) {
       res.status(500).json({ error: "Failed to dispatch email verification link. " + err.message });
@@ -385,6 +502,8 @@ async function startServer() {
             phone: reg.phone,
             businessName: reg.businessName,
             password: reg.password,
+            pin: reg.pin || '1234',
+            photoUrl: existing[0].photoUrl || null,
             updatedAt: new Date()
           }).where(eq(staff.id, existing[0].id));
         } else {
@@ -397,7 +516,8 @@ async function startServer() {
             phone: reg.phone,
             businessName: reg.businessName,
             password: reg.password,
-            pin: '1234', // Default placeholder PIN
+            pin: reg.pin || '1234',
+            photoUrl: null,
             status: 'active'
           });
         }
@@ -411,6 +531,8 @@ async function startServer() {
             phone: reg.phone,
             businessName: reg.businessName,
             password: reg.password,
+            pin: reg.pin || '1234',
+            photoUrl: existing[0].photoUrl || null,
             updatedAt: new Date()
           }).where(eq(users.id, existing[0].id));
         } else {
@@ -423,6 +545,8 @@ async function startServer() {
             phone: reg.phone,
             businessName: reg.businessName,
             password: reg.password,
+            pin: reg.pin || '1234',
+            photoUrl: null,
           });
         }
         console.log(`[Database] Manager/Owner registered/updated in users table: ${emailLower}`);
@@ -560,45 +684,55 @@ async function startServer() {
     }
   });
 
+  const buildSellersResponse = async () => {
+    const allUsers = await db.select().from(users);
+    const allStaff = await db.select().from(staff);
+
+    const combinedSellers: any[] = [];
+
+    for (const u of allUsers) {
+      if (u.password) {
+        combinedSellers.push({
+          email: u.email,
+          phone: u.phone,
+          businessName: u.businessName,
+          ownerName: u.name,
+          password: u.password,
+          role: u.role || 'Manager/Owner',
+          photoUrl: u.photoUrl
+        });
+      }
+    }
+
+    for (const s of allStaff) {
+      if (s.password && s.email) {
+        combinedSellers.push({
+          email: s.email,
+          phone: s.phone,
+          businessName: s.businessName,
+          ownerName: s.name,
+          password: s.password,
+          role: s.role || 'Staff',
+          photoUrl: s.photoUrl
+        });
+      }
+    }
+
+    return { success: true, sellers: combinedSellers };
+  };
+
   // 10. GET ALL REGISTERED SELLERS (Sync with client local state)
+  app.get("/api/sellers", async (req, res) => {
+    try {
+      res.json(await buildSellersResponse());
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to fetch registered sellers: " + err.message });
+    }
+  });
+
   app.get("/api/auth/sellers", async (req, res) => {
     try {
-      const allUsers = await db.select().from(users);
-      const allStaff = await db.select().from(staff);
-
-      const combinedSellers: any[] = [];
-
-      // Add registered users (Managers) who have a password set
-      for (const u of allUsers) {
-        if (u.password) {
-          combinedSellers.push({
-            email: u.email,
-            phone: u.phone,
-            businessName: u.businessName,
-            ownerName: u.name,
-            password: u.password,
-            role: u.role || 'Manager/Owner',
-            photoUrl: u.photoUrl
-          });
-        }
-      }
-
-      // Add registered staff who have a password set
-      for (const s of allStaff) {
-        if (s.password && s.email) {
-          combinedSellers.push({
-            email: s.email,
-            phone: s.phone,
-            businessName: s.businessName,
-            ownerName: s.name,
-            password: s.password,
-            role: s.role || 'Staff',
-            photoUrl: s.photoUrl
-          });
-        }
-      }
-
-      res.json({ success: true, sellers: combinedSellers });
+      res.json(await buildSellersResponse());
     } catch (err: any) {
       res.status(500).json({ error: "Failed to fetch registered sellers: " + err.message });
     }
@@ -621,6 +755,10 @@ async function startServer() {
         .set({ photoUrl, updatedAt: new Date() })
         .where(eq(staff.email, email.toLowerCase()));
 
+      await db.update(users)
+        .set({ photoUrl, updatedAt: new Date() })
+        .where(eq(users.email, email.toLowerCase()));
+
       console.log(`[Database] Profile picture updated for seller: ${email}`);
       res.json({ success: true });
     } catch (err: any) {
@@ -636,7 +774,7 @@ async function startServer() {
   app.get("/api/public/products", async (req, res) => {
     try {
       const items = await db.select().from(menuItems).where(eq(menuItems.status, "active"));
-      res.json(items.map(item => ({
+      res.json(items.map((item: any) => ({
         ...item,
         price: parseFloat(item.price),
         ingredients: item.ingredientsJson ? JSON.parse(item.ingredientsJson) : [],
@@ -648,27 +786,255 @@ async function startServer() {
     }
   });
 
-  // 2. POST /api/public/orders - Customer checkout places order directly to Seller
-  app.post("/api/public/orders", async (req, res) => {
+  // Compatibility alias for older or external customer apps that request /menu
+  app.get("/menu", async (req, res) => {
     try {
-      const {
+      const items = await db.select().from(menuItems).where(eq(menuItems.status, "active"));
+      res.json(items.map((item: any) => ({
+        ...item,
+        price: parseFloat(item.price),
+        ingredients: item.ingredientsJson ? JSON.parse(item.ingredientsJson) : [],
+        allergens: item.allergensJson ? JSON.parse(item.allergensJson) : [],
+      })));
+    } catch (error: any) {
+      console.error("Error fetching /menu products:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch products" });
+    }
+  });
+
+  // Compatibility alias for older or external customer apps expecting /api/menu
+  app.get("/api/menu", async (req, res) => {
+    try {
+      const items = await db.select().from(menuItems).where(eq(menuItems.status, "active"));
+      res.json(items.map((item: any) => ({
+        ...item,
+        price: parseFloat(item.price),
+        ingredients: item.ingredientsJson ? JSON.parse(item.ingredientsJson) : [],
+        allergens: item.allergensJson ? JSON.parse(item.allergensJson) : [],
+      })));
+    } catch (error: any) {
+      console.error("Error fetching /api/menu products:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch products" });
+    }
+  });
+
+  // Compatibility alias for older or external customer apps expecting /api/products
+  app.get("/api/products", async (req, res) => {
+    try {
+      const items = await db.select().from(menuItems).where(eq(menuItems.status, "active"));
+      res.json(items.map((item: any) => ({
+        ...item,
+        price: parseFloat(item.price),
+        ingredients: item.ingredientsJson ? JSON.parse(item.ingredientsJson) : [],
+        allergens: item.allergensJson ? JSON.parse(item.allergensJson) : [],
+      })));
+    } catch (error: any) {
+      console.error("Error fetching /api/products:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch products" });
+    }
+  });
+
+  const normalizeExternalOrderItems = (payloadItems: any[]) => {
+    return payloadItems.map((item: any) => {
+      const normalizedQty = Number(item.quantity ?? item.qty ?? item.count ?? 0);
+      const normalizedPrice = Number(item.price ?? item.unitPrice ?? item.amount ?? 0);
+      return {
+        id: item.id || item.productId || item.menuItemId || null,
+        name: item.name || item.productName || item.menuItemName || null,
+        qty: normalizedQty,
+        price: normalizedPrice,
+        notes: item.notes || item.note || undefined,
+        allergies: item.allergies || undefined,
+        allergyAction: item.allergyAction || undefined,
+        allergyDetails: item.allergyDetails || undefined,
+      };
+    });
+  };
+
+  const normalizeOrderStatus = (status: string | undefined) => {
+    if (!status) return 'received';
+    const normalized = String(status).trim().toLowerCase();
+    if (normalized === 'pending' || normalized === 'new' || normalized === 'waiting') return 'pending';
+    if (normalized === 'received' || normalized === 'preparing' || normalized === 'ready' || normalized === 'completed' || normalized === 'cancelled') return normalized;
+    return 'received';
+  };
+
+  const createCustomerOrder = async (req: any, res: any) => {
+    try {
+      const payload = req.body || {};
+      const customerName = payload.customerName || payload.customer_name || payload.name || "Online Customer";
+      const customerPhone = payload.customerPhone || payload.customer_phone || null;
+      const deliveryAddress = payload.deliveryAddress || payload.delivery_address || null;
+      const paymentMethod = payload.paymentMethod || payload.payment_method || "cash";
+      const rawItems = payload.items || payload.orderItems || payload.lineItems || [];
+      const items = Array.isArray(rawItems) ? normalizeExternalOrderItems(rawItems) : [];
+      const orderStatus = normalizeOrderStatus(payload.orderStatus || payload.status || payload.state);
+
+      console.log('[Customer Order API] Incoming payload:', {
         customerName,
         customerPhone,
         deliveryAddress,
-        items, // array of { id, name, qty, price }
-        paymentMethod = "cash",
-      } = req.body;
+        paymentMethod,
+        orderStatus,
+        itemsCount: items.length,
+      });
 
-      if (!items || !Array.isArray(items) || items.length === 0) {
+      if (items.length === 0) {
         return res.status(400).json({ error: "Missing or empty order items" });
       }
 
-      // Calculate order total
       let total = 0;
       for (const item of items) {
         total += Number(item.price) * Number(item.qty);
       }
 
+      const orderId = crypto.randomUUID();
+      const orderNumber = `ORD-${Date.now().toString().slice(-4)}`;
+
+      await db.insert(orders).values({
+        id: orderId,
+        orderNumber,
+        customerName,
+        customerPhone,
+        deliveryAddress,
+        itemsJson: JSON.stringify(items),
+        totalAmount: String(total),
+        paymentStatus: payload.paymentStatus || payload.payment_status || "unpaid",
+        paymentMethod,
+        orderStatus,
+        actionBy: payload.actionBy || payload.action_by || "Online Order",
+        stockReduced: false,
+      });
+
+      const savedOrders = await db.select().from(orders).where(eq(orders.id, orderId));
+      const savedOrder = savedOrders[0];
+
+      console.log(`[Customer Order API] Order created: ${orderId} / ${orderNumber}`);
+
+      const orderItems = JSON.parse(savedOrder.itemsJson).map((item: any) => ({
+        ...item,
+        quantity: item.qty,
+        productId: item.productId || item.id,
+      }));
+
+      const responseOrder = {
+        ...savedOrder,
+        totalAmount: parseFloat(savedOrder.totalAmount),
+        items: orderItems,
+        status: savedOrder.orderStatus,
+        orderStatus: savedOrder.orderStatus,
+      };
+
+      emitOrderEvent("new-order", { order: responseOrder });
+
+      res.status(201).json({
+        success: true,
+        order: responseOrder
+      });
+    } catch (error: any) {
+      console.error("Error placing customer order:", error);
+      res.status(500).json({ error: error.message || "Failed to place order" });
+    }
+  };
+
+  // 2. POST /api/public/orders - Customer checkout places order directly to Seller
+  app.post(/^\/(?:api\/)?(?:public\/)?orders(?:\/checkout)?$/i, createCustomerOrder);
+
+  // 3. GET /api/public/orders/:id - Customer / Admin retrieve details of a specific order
+  app.get("/api/public/orders/:id", async (req, res) => {
+    try {
+      const result = await db.select().from(orders).where(eq(orders.id, req.params.id));
+      if (result.length === 0) {
+        return res.status(404).json({ error: "Order not found" });
+      }
+      res.json({
+        ...result[0],
+        totalAmount: parseFloat(result[0].totalAmount),
+        orderStatus: result[0].orderStatus,
+        status: result[0].orderStatus,
+        items: JSON.parse(result[0].itemsJson),
+      });
+    } catch (error: any) {
+      console.error("Error fetching specific order:", error);
+      res.status(500).json({ error: error.message || "Failed to retrieve order" });
+    }
+  });
+
+  app.get(/^\/(?:api\/)?orders$/i, async (req, res) => {
+    try {
+      const results = await db.select().from(orders);
+      res.json({
+        success: true,
+        count: results.length,
+        source: 'local',
+        orders: results.map((o: any) => ({
+          ...o,
+          totalAmount: parseFloat(o.totalAmount),
+          status: o.orderStatus,
+          orderStatus: o.orderStatus,
+          items: JSON.parse(o.itemsJson).map((item: any) => ({
+            ...item,
+            quantity: item.qty,
+            productId: item.productId || item.id,
+          })),
+        })),
+      });
+    } catch (error: any) {
+      console.error("Error listing orders via compatibility route:", error);
+      res.status(500).json({ error: error.message || "Failed to list orders" });
+    }
+  });
+
+  const normalizeOrderItems = (payloadItems: any[]) => {
+    return payloadItems.map((item: any) => ({
+      id: item.id || item.productId || item.menuItemId || null,
+      productId: item.productId || item.menuItemId || item.id || null,
+      menuItemId: item.menuItemId || item.productId || item.id || null,
+      name: item.name || item.productName || item.menuItemName || null,
+      qty: Number(item.quantity ?? item.qty ?? item.quantity ?? item.count ?? 0),
+      price: Number(item.price ?? item.unitPrice ?? item.amount ?? 0),
+      lineTotal: Number(item.price ?? item.unitPrice ?? item.amount ?? 0) * Number(item.quantity ?? item.qty ?? item.count ?? 0),
+    }));
+  };
+
+  const buildOrderResponse = (inserted: any[]) => {
+    const order = inserted[0];
+    const items = JSON.parse(order.itemsJson).map((item: any) => ({
+      ...item,
+      quantity: item.qty,
+      productId: item.productId || item.id,
+    }));
+
+    return {
+      success: true,
+      order: {
+        ...order,
+        totalAmount: parseFloat(order.totalAmount),
+        items,
+        status: order.orderStatus,
+        orderStatus: order.orderStatus,
+      }
+    };
+  };
+
+  // Compatibility alias for older or external customer apps expecting /api/orders/checkout
+  app.post("/api/orders/checkout", async (req, res) => {
+    try {
+      const {
+        items: rawItems,
+        customerName,
+        customerPhone,
+        deliveryAddress,
+        paymentMethod = "cash",
+      } = req.body;
+
+      const items = Array.isArray(rawItems) ? normalizeOrderItems(rawItems) : [];
+      if (items.length === 0) {
+        console.error("/api/orders/checkout missing items payload:", req.body);
+        return res.status(400).json({ success: false, message: "Order placement failed", error: "Missing or empty order items" });
+      }
+
+      const total = items.reduce((sum: number, item: any) => sum + item.lineTotal, 0);
       const orderId = crypto.randomUUID();
       const orderNumber = `ORD-${Date.now().toString().slice(-4)}`;
 
@@ -681,41 +1047,108 @@ async function startServer() {
         itemsJson: JSON.stringify(items),
         totalAmount: String(total),
         paymentStatus: "unpaid",
-        paymentMethod: paymentMethod,
+        paymentMethod,
         orderStatus: "received",
         actionBy: "Online Order",
         stockReduced: false,
       }).returning();
 
-      res.status(201).json({
-        success: true,
-        order: {
-          ...newOrder[0],
-          totalAmount: parseFloat(newOrder[0].totalAmount),
-          items: JSON.parse(newOrder[0].itemsJson),
-        }
-      });
+      const responsePayload = buildOrderResponse(newOrder);
+      emitOrderEvent("new-order", { order: responsePayload.order });
+      res.status(201).json(responsePayload);
     } catch (error: any) {
-      console.error("Error placing public order:", error);
-      res.status(500).json({ error: error.message || "Failed to place order" });
+      console.error("Error creating order at /api/orders/checkout:", error, { body: req.body });
+      res.status(500).json({ success: false, message: "Order placement failed", error: error.message || "Failed to create order" });
     }
   });
 
-  // 3. GET /api/public/orders/:id - Customer / Admin retrieve details of a specific order
-  app.get("/api/public/orders/:id", async (req, res) => {
+  // Compatibility alias for older or external customer apps expecting /orders/checkout
+  app.post("/orders/checkout", async (req, res) => {
     try {
-      const result = await db.select().from(orders).where(eq(orders.id, req.params.id));
-      if (result.length === 0) {
-        return res.status(404).json({ error: "Order not found" });
+      const {
+        items: rawItems,
+        customerName,
+        customerPhone,
+        deliveryAddress,
+        paymentMethod = "cash",
+      } = req.body;
+
+      const items = Array.isArray(rawItems) ? normalizeOrderItems(rawItems) : [];
+      if (items.length === 0) {
+        console.error("/orders/checkout missing items payload:", req.body);
+        return res.status(400).json({ success: false, message: "Order placement failed", error: "Missing or empty order items" });
       }
-      res.json({
-        ...result[0],
-        totalAmount: parseFloat(result[0].totalAmount),
-        items: JSON.parse(result[0].itemsJson),
-      });
+
+      const total = items.reduce((sum: number, item: any) => sum + item.lineTotal, 0);
+      const orderId = crypto.randomUUID();
+      const orderNumber = `ORD-${Date.now().toString().slice(-4)}`;
+
+      const newOrder = await db.insert(orders).values({
+        id: orderId,
+        orderNumber,
+        customerName: customerName || "Online Customer",
+        customerPhone: customerPhone || null,
+        deliveryAddress: deliveryAddress || null,
+        itemsJson: JSON.stringify(items),
+        totalAmount: String(total),
+        paymentStatus: "unpaid",
+        paymentMethod,
+        orderStatus: "received",
+        actionBy: "Online Order",
+        stockReduced: false,
+      }).returning();
+
+      const responsePayload = buildOrderResponse(newOrder);
+      emitOrderEvent("new-order", { order: responsePayload.order });
+      res.status(201).json(responsePayload);
     } catch (error: any) {
-      console.error("Error fetching specific order:", error);
-      res.status(500).json({ error: error.message || "Failed to retrieve order" });
+      console.error("Error creating order at /orders/checkout:", error, { body: req.body });
+      res.status(500).json({ success: false, message: "Order placement failed", error: error.message || "Failed to create order" });
+    }
+  });
+
+  app.put("/api/public/orders/:id/status", async (req, res) => {
+    try {
+      const { status, actionBy } = req.body || {};
+      const normalizedStatus = normalizeOrderStatus(status);
+
+      if (!normalizedStatus) {
+        return res.status(400).json({ success: false, error: "Status is required" });
+      }
+
+      const existingOrders = await db.select().from(orders).where(eq(orders.id, req.params.id));
+      const existingOrder = existingOrders[0];
+      if (!existingOrder) {
+        return res.status(404).json({ success: false, error: "Order not found" });
+      }
+
+      const updatedOrders = await db.update(orders)
+        .set({
+          orderStatus: normalizedStatus,
+          actionBy: actionBy || existingOrder.actionBy || "Seller Portal",
+          updatedAt: new Date(),
+        })
+        .where(eq(orders.id, req.params.id))
+        .returning();
+
+      const updatedOrder = updatedOrders[0];
+      const responseOrder = {
+        ...updatedOrder,
+        totalAmount: parseFloat(updatedOrder.totalAmount),
+        status: updatedOrder.orderStatus,
+        orderStatus: updatedOrder.orderStatus,
+        items: JSON.parse(updatedOrder.itemsJson).map((item: any) => ({
+          ...item,
+          quantity: item.qty,
+          productId: item.productId || item.id,
+        })),
+      };
+
+      emitOrderEvent("order-status-updated", { order: responseOrder, previousStatus: existingOrder.orderStatus });
+      res.json({ success: true, order: responseOrder });
+    } catch (error: any) {
+      console.error("Error updating order status:", error);
+      res.status(500).json({ success: false, error: error.message || "Failed to update order status" });
     }
   });
 
@@ -723,16 +1156,126 @@ async function startServer() {
   app.get("/api/public/orders", async (req, res) => {
     try {
       const results = await db.select().from(orders);
-      res.json(results.map(o => ({
-        ...o,
-        totalAmount: parseFloat(o.totalAmount),
-        items: JSON.parse(o.itemsJson),
-      })));
+      res.json({
+        success: true,
+        count: results.length,
+        source: 'local',
+        orders: results.map((o: any) => ({
+          ...o,
+          totalAmount: parseFloat(o.totalAmount),
+          status: o.orderStatus,
+          orderStatus: o.orderStatus,
+          items: JSON.parse(o.itemsJson).map((item: any) => ({
+            ...item,
+            quantity: item.qty,
+            productId: item.productId || item.id,
+          })),
+        })),
+      });
     } catch (error: any) {
       console.error("Error listing public orders:", error);
       res.status(500).json({ error: error.message || "Failed to list orders" });
     }
   });
+
+  // 4a. GET /api/seller/orders - Seller retrieves orders for their store only
+  app.get("/api/seller/orders", requireSellerAuth, async (req, res) => {
+    const sellerReq = req as SellerAuthRequest;
+    const sellerId = sellerReq.seller?.id;
+    if (!sellerId) {
+      return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
+
+    try {
+      const results = await db.select().from(orders).where(eq(orders.sellerId, sellerId));
+      res.json({
+        success: true,
+        count: results.length,
+        source: 'seller',
+        orders: results.map((o: any) => ({
+          id: o.id,
+          orderNumber: o.orderNumber,
+          customerName: o.customerName,
+          customerPhone: o.customerPhone,
+          deliveryAddress: o.deliveryAddress,
+          totalAmount: parseFloat(o.totalAmount),
+          paymentStatus: o.paymentStatus,
+          paymentMethod: o.paymentMethod,
+          status: o.orderStatus,
+          orderStatus: o.orderStatus,
+          actionBy: o.actionBy,
+          stockReduced: Boolean(o.stockReduced),
+          createdAt: o.createdAt,
+          updatedAt: o.updatedAt,
+          items: (() => {
+            try {
+              return o.itemsJson ? JSON.parse(o.itemsJson) : [];
+            } catch {
+              return [];
+            }
+          })(),
+        })),
+      });
+    } catch (error: any) {
+      console.error("Error fetching seller orders:", error);
+      res.status(500).json({ success: false, message: error.message || "Failed to fetch seller orders" });
+    }
+  });
+
+  app.patch("/api/seller/orders/:id/status", requireSellerAuth, async (req, res) => {
+    const sellerReq = req as SellerAuthRequest;
+    const sellerId = sellerReq.seller?.id;
+    const { id } = req.params;
+    const { status } = req.body || {};
+
+    if (!sellerId || !id || !status) {
+      return res.status(400).json({ success: false, message: 'Invalid request' });
+    }
+
+    try {
+      const existing = await db.select().from(orders).where(eq(orders.id, id)).where(eq(orders.sellerId, sellerId));
+      const order = existing[0];
+      if (!order) {
+        return res.status(403).json({ success: false, message: 'Order not found' });
+      }
+
+      await db.update(orders)
+        .set({ orderStatus: status, updatedAt: new Date() })
+        .where(eq(orders.id, id));
+
+      res.json({ success: true, message: 'Order status updated' });
+    } catch (error: any) {
+      console.error("Error updating seller order status:", error);
+      res.status(500).json({ success: false, message: 'Failed to update order status' });
+    }
+  });
+
+  // Alias for non-public customer integrations that request /api/orders
+  app.get("/api/orders", async (req, res) => {
+    try {
+      const results = await db.select().from(orders);
+      res.json({
+        success: true,
+        count: results.length,
+        source: 'local',
+        orders: results.map((o: any) => ({
+          ...o,
+          totalAmount: parseFloat(o.totalAmount),
+          status: o.orderStatus,
+          orderStatus: o.orderStatus,
+          items: JSON.parse(o.itemsJson).map((item: any) => ({
+            ...item,
+            quantity: item.qty,
+            productId: item.productId || item.id,
+          })),
+        })),
+      });
+    } catch (error: any) {
+      console.error("Error listing orders alias /api/orders:", error);
+      res.status(500).json({ error: error.message || "Failed to list orders" });
+    }
+  });
+
 
   // 5. GET /api/public/stats - Admin retrieves general store sales performance and stats
   app.get("/api/public/stats", async (req, res) => {
@@ -768,7 +1311,7 @@ async function startServer() {
 
       // 1. MENU ITEMS SYNC
       const dbMenuItems = await db.select().from(menuItems);
-      const menuItemMap = new Map<string, any>(dbMenuItems.map(item => [item.id, item]));
+      const menuItemMap = new Map<string, any>(dbMenuItems.map((item: any) => [item.id, item]));
 
       for (const clientItem of clientMenuItems) {
         const serverItem = menuItemMap.get(clientItem.id);
@@ -811,7 +1354,7 @@ async function startServer() {
 
       // 2. STAFF SYNC
       const dbStaff = await db.select().from(staff);
-      const staffMap = new Map<string, any>(dbStaff.map(member => [member.uid, member]));
+      const staffMap = new Map<string, any>(dbStaff.map((member: any) => [member.uid, member]));
 
       for (const clientMember of clientStaff) {
         const serverMember = staffMap.get(clientMember.uid);
@@ -846,7 +1389,7 @@ async function startServer() {
 
       // 3. ORDERS SYNC
       const dbOrders = await db.select().from(orders);
-      const ordersMap = new Map<string, any>(dbOrders.map(order => [order.id, order]));
+      const ordersMap = new Map<string, any>(dbOrders.map((order: any) => [order.id, order]));
 
       for (const clientOrder of clientOrders) {
         const serverOrder = ordersMap.get(clientOrder.id);
@@ -894,7 +1437,7 @@ async function startServer() {
 
       // 4. AUDIT LOGS SYNC
       const dbAuditLogs = await db.select().from(auditLogs);
-      const logsMap = new Map(dbAuditLogs.map(log => [log.id, log]));
+      const logsMap = new Map(dbAuditLogs.map((log: any) => [log.id, log]));
 
       for (const clientLog of clientAuditLogs) {
         const serverLog = logsMap.get(clientLog.id);
@@ -917,14 +1460,14 @@ async function startServer() {
 
       res.json({
         success: true,
-        menuItems: finalMenuItems.map(item => ({
+        menuItems: finalMenuItems.map((item: any) => ({
           ...item,
           price: parseFloat(item.price),
           ingredients: item.ingredientsJson ? JSON.parse(item.ingredientsJson) : [],
           allergens: item.allergensJson ? JSON.parse(item.allergensJson) : [],
         })),
         staff: finalStaff,
-        orders: finalOrders.map(order => ({
+        orders: finalOrders.map((order: any) => ({
           ...order,
           price: parseFloat(order.totalAmount),
           totalAmount: parseFloat(order.totalAmount),
@@ -984,6 +1527,32 @@ async function startServer() {
             });
           } else if (type === 'DELETE_PRODUCT') {
             await db.delete(menuItems).where(eq(menuItems.id, payload.id));
+          } else if (type === 'CREATE_STAFF' || type === 'UPDATE_STAFF') {
+            await db.insert(staff).values({
+              uid: payload.uid,
+              email: payload.email || null,
+              name: payload.name,
+              pin: payload.pin || null,
+              role: payload.role || 'Staff',
+              status: payload.status || 'active',
+              phone: payload.phone || null,
+              businessName: payload.businessName || null,
+              password: payload.password || null,
+              photoUrl: payload.photoUrl || null,
+              updatedAt: new Date(payload.updatedAt || Date.now()),
+            }).onConflictDoUpdate({
+              target: staff.uid,
+              set: {
+                name: payload.name,
+                pin: payload.pin !== null ? payload.pin : undefined,
+                role: payload.role || 'Staff',
+                status: payload.status || 'active',
+                photoUrl: payload.photoUrl !== null ? payload.photoUrl : undefined,
+                updatedAt: new Date(payload.updatedAt || Date.now()),
+              }
+            });
+          } else if (type === 'DELETE_STAFF') {
+            await db.delete(staff).where(eq(staff.uid, payload.uid));
           } else if (type === 'CREATE_ORDER' || type === 'UPDATE_ORDER') {
             await db.insert(orders).values({
               id: payload.id,
@@ -1030,30 +1599,32 @@ async function startServer() {
     }
   });
 
-  // Register Google Authed Manager inside PostgreSQL
-  app.post("/api/register", requireAuth, async (req: AuthRequest, res) => {
+  // Register manager inside PostgreSQL without Firebase auth enforcement
+  app.post("/api/register", async (req, res) => {
     try {
-      const uid = req.user?.uid;
-      const email = req.user?.email;
-      const name = req.user?.name || email?.split("@")[0] || "Manager";
+      const { uid, email, name, role } = req.body;
+      const effectiveUid = uid || crypto.randomUUID();
+      const effectiveEmail = email?.toLowerCase?.() || "unknown@local";
+      const effectiveName = name || effectiveEmail.split("@")[0] || "Manager";
+      const effectiveRole = role || "Manager";
 
-      if (!uid || !email) {
-        return res.status(400).json({ error: "Missing identity credentials" });
+      if (!email) {
+        return res.status(400).json({ error: "Email is required for registration" });
       }
 
-      // Upsert user
       const result = await db.insert(users)
         .values({
-          uid,
-          email,
-          name,
-          role: "Manager",
+          uid: effectiveUid,
+          email: effectiveEmail,
+          name: effectiveName,
+          role: effectiveRole,
         })
         .onConflictDoUpdate({
           target: users.uid,
           set: {
-            email,
-            name,
+            email: effectiveEmail,
+            name: effectiveName,
+            role: effectiveRole,
           },
         })
         .returning();
@@ -1066,7 +1637,7 @@ async function startServer() {
   });
 
   // Bi-directional Consolidated Offline-First Sync Endpoint
-  app.post("/api/sync", requireAuth, async (req: AuthRequest, res) => {
+  app.post("/api/sync", async (req, res) => {
     try {
       const {
         clientMenuItems = [],
@@ -1079,7 +1650,7 @@ async function startServer() {
       // 1. MENU ITEMS SYNC
       // -------------------------------------------------------------
       const dbMenuItems = await db.select().from(menuItems);
-      const menuItemMap = new Map<string, any>(dbMenuItems.map(item => [item.id, item]));
+      const menuItemMap = new Map<string, any>(dbMenuItems.map((item: any) => [item.id, item]));
 
       for (const clientItem of clientMenuItems) {
         const serverItem = menuItemMap.get(clientItem.id);
@@ -1126,7 +1697,7 @@ async function startServer() {
       // 2. STAFF SYNC
       // -------------------------------------------------------------
       const dbStaff = await db.select().from(staff);
-      const staffMap = new Map<string, any>(dbStaff.map(member => [member.uid, member]));
+      const staffMap = new Map<string, any>(dbStaff.map((member: any) => [member.uid, member]));
 
       for (const clientMember of clientStaff) {
         const serverMember = staffMap.get(clientMember.uid);
@@ -1163,7 +1734,7 @@ async function startServer() {
       // 3. ORDERS SYNC
       // -------------------------------------------------------------
       const dbOrders = await db.select().from(orders);
-      const ordersMap = new Map<string, any>(dbOrders.map(order => [order.id, order]));
+      const ordersMap = new Map<string, any>(dbOrders.map((order: any) => [order.id, order]));
 
       for (const clientOrder of clientOrders) {
         const serverOrder = ordersMap.get(clientOrder.id);
@@ -1213,7 +1784,7 @@ async function startServer() {
       // 4. AUDIT LOGS SYNC
       // -------------------------------------------------------------
       const dbAuditLogs = await db.select().from(auditLogs);
-      const logsMap = new Map(dbAuditLogs.map(log => [log.id, log]));
+      const logsMap = new Map(dbAuditLogs.map((log: any) => [log.id, log]));
 
       for (const clientLog of clientAuditLogs) {
         const serverLog = logsMap.get(clientLog.id);
@@ -1236,14 +1807,14 @@ async function startServer() {
 
       res.json({
         success: true,
-        menuItems: finalMenuItems.map(item => ({
+        menuItems: finalMenuItems.map((item: any) => ({
           ...item,
           price: parseFloat(item.price),
           ingredients: item.ingredientsJson ? JSON.parse(item.ingredientsJson) : [],
           allergens: item.allergensJson ? JSON.parse(item.allergensJson) : [],
         })),
         staff: finalStaff,
-        orders: finalOrders.map(order => ({
+        orders: finalOrders.map((order: any) => ({
           ...order,
           price: parseFloat(order.totalAmount), // helper
           totalAmount: parseFloat(order.totalAmount),
@@ -1259,7 +1830,7 @@ async function startServer() {
   });
 
   // Transactional sync endpoint for queuing/replaying operations
-  app.post("/api/sync/operations", requireAuth, async (req: AuthRequest, res) => {
+  app.post("/api/sync/operations", async (req, res) => {
     try {
       const { operations = [] } = req.body;
 
@@ -1305,6 +1876,32 @@ async function startServer() {
             });
           } else if (type === 'DELETE_PRODUCT') {
             await db.delete(menuItems).where(eq(menuItems.id, payload.id));
+          } else if (type === 'CREATE_STAFF' || type === 'UPDATE_STAFF') {
+            await db.insert(staff).values({
+              uid: payload.uid,
+              email: payload.email || null,
+              name: payload.name,
+              pin: payload.pin || null,
+              role: payload.role || 'Staff',
+              status: payload.status || 'active',
+              phone: payload.phone || null,
+              businessName: payload.businessName || null,
+              password: payload.password || null,
+              photoUrl: payload.photoUrl || null,
+              updatedAt: new Date(payload.updatedAt || Date.now()),
+            }).onConflictDoUpdate({
+              target: staff.uid,
+              set: {
+                name: payload.name,
+                pin: payload.pin !== null ? payload.pin : undefined,
+                role: payload.role || 'Staff',
+                status: payload.status || 'active',
+                photoUrl: payload.photoUrl !== null ? payload.photoUrl : undefined,
+                updatedAt: new Date(payload.updatedAt || Date.now()),
+              }
+            });
+          } else if (type === 'DELETE_STAFF') {
+            await db.delete(staff).where(eq(staff.uid, payload.uid));
           } else if (type === 'CREATE_ORDER' || type === 'UPDATE_ORDER') {
             await db.insert(orders).values({
               id: payload.id,
@@ -1352,6 +1949,32 @@ async function startServer() {
     }
   });
 
+  app.get("/api/events", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    const client = { res };
+    sseClients.add(client);
+    res.write(`event: connected\ndata: ${JSON.stringify({ status: "connected", timestamp: new Date().toISOString() })}\n\n`);
+
+    req.on("close", () => sseClients.delete(client));
+    req.on("aborted", () => sseClients.delete(client));
+  });
+
+  app.use((err: any, req: any, res: any, next: any) => {
+    if (err?.type === "entity.parse.failed" || err?.name === "BadRequestError" || err?.message === "request aborted" || err?.code === "ABORT_ERR") {
+      console.warn(`[Server] Ignored aborted or invalid request body for ${req.method} ${req.path}`);
+      if (!res.headersSent) {
+        res.status(400).json({ success: false, error: "Request body was aborted or invalid" });
+      }
+      return;
+    }
+    next(err);
+  });
+
   // Vite static file server configuration for development and production build routes
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -1367,9 +1990,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Express server fully functional. Online at port ${PORT}`);
-  });
+  listenOnPort(PORT);
 }
 
 startServer();

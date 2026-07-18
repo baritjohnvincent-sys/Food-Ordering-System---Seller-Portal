@@ -12,11 +12,23 @@ export default defineConfig(() => {
       },
     },
     server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
-      hmr: process.env.DISABLE_HMR !== 'true',
+      host: '0.0.0.0',
+      port: Number(process.env.PORT || 3000),
+      strictPort: false,
+      // Allow specific dev hosts (e.g. ngrok tunnels)
+      allowedHosts: [
+        'slashing-lucid-retype.ngrok-free.dev',
+        'visible-whomever-sprint.ngrok-free.dev',
+        'renovator-hardener-dispersed.ngrok-free.dev',
+      ],
+      hmr: {
+        host: '127.0.0.1',
+        port: Number(process.env.VITE_HMR_PORT || 24679),
+      },
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      watch: process.env.DISABLE_HMR === 'true' ? null : {
+        ignored: ['**/.env*', '**/.env.*'],
+      },
     },
   };
 });

@@ -1,13 +1,34 @@
+
 import { relations } from 'drizzle-orm';
 import { integer, pgTable, serial, text, timestamp, numeric, boolean } from 'drizzle-orm/pg-core';
 
-// Users table (Manager/Owner registered via Google Auth or email/password)
+// 1. Users table (Manager/Owner registered via Google Auth or email/password)
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
+  sellerId: integer('seller_id'), // ADDED: Links this manager account to their store ID
   uid: text('uid').notNull().unique(), // Firebase Auth UID or generated UID
   email: text('email').notNull(),
   name: text('name'),
   role: text('role').default('Manager').notNull(), // 'Manager' or 'Manager/Owner'
+  phone: text('phone'),
+  businessName: text('business_name'),
+  password: text('password'),
+  pin: text('pin'), // 4-digit PIN for Manager/Owner access
+  photoUrl: text('photo_url'),
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+// 2. Staff profiles (Now tied to their specific store)
+export const staff = pgTable('staff', {
+  id: serial('id').primaryKey(),
+  sellerId: integer('seller_id').notNull(), // ADDED: Tracks which store location this staff belongs to
+  uid: text('uid').notNull().unique(), // Stable unique identifier across syncs (e.g. UUID)
+  email: text('email'), // Optional email for staff login
+  name: text('name').notNull(),
+  pin: text('pin'), // 4-digit PIN for quick cashier lock screens
+  role: text('role').default('Staff').notNull(), // 'Manager' or 'Staff'
+  status: text('status').default('active').notNull(), // 'active', 'inactive'
   phone: text('phone'),
   businessName: text('business_name'),
   password: text('password'),
@@ -16,26 +37,10 @@ export const users = pgTable('users', {
   updatedAt: timestamp('updated_at').defaultNow(),
 });
 
-// Staff profiles created by manager or registered directly
-export const staff = pgTable('staff', {
-  id: serial('id').primaryKey(),
-  uid: text('uid').notNull().unique(), // Stable unique identifier across syncs (e.g. UUID)
-  email: text('email'), // Optional email for staff login
-  name: text('name').notNull(),
-  pin: text('pin'), // Made nullable to support password-based logins
-  role: text('role').default('Staff').notNull(), // 'Manager' or 'Staff'
-  status: text('status').default('active').notNull(), // 'active', 'inactive'
-  phone: text('phone'),
-  businessName: text('business_name'),
-  password: text('password'),
-  photoUrl: text('photo_url'), // Profile picture of staff (base64 or URL)
-  createdAt: timestamp('created_at').defaultNow(),
-  updatedAt: timestamp('updated_at').defaultNow(),
-});
-
-// Menu Items (for inventory and prices, synced to cloud)
+// 3. Menu Items (Linked to the store ID)
 export const menuItems = pgTable('menu_items', {
   id: text('id').primaryKey(), // Client-created stable UUID
+  sellerId: integer('seller_id').notNull(), // ADDED: Tracks which store owns this menu item
   name: text('name').notNull(),
   category: text('category').notNull(), // e.g., Mains, Drinks, Desserts
   price: numeric('price', { precision: 10, scale: 2 }).notNull(),
@@ -48,44 +53,67 @@ export const menuItems = pgTable('menu_items', {
   image: text('image'), // Public URL of the menu item image
 });
 
-// Orders (placed offline-first, synced to cloud)
+// 4. Orders Table
 export const orders = pgTable('orders', {
-  id: text('id').primaryKey(), // Client-generated UUID
+  id: text('id').primaryKey(), // Client-generated UUID (matches Customer orders.id)
+  sellerId: integer('seller_id').notNull(), // ADDED: Ensures synced orders end up in the right tenant dashboard
   orderNumber: text('order_number').notNull(), // e.g., "ORD-1002"
   customerName: text('customer_name'),
   customerPhone: text('customer_phone'),
   deliveryAddress: text('delivery_address'),
-  itemsJson: text('items_json').notNull(), // JSON list of items ordered: [{id, name, qty, price}]
+  itemsJson: text('items_json').notNull(), // Kept for fast local offline caching & UI rendering
   totalAmount: numeric('total_amount', { precision: 10, scale: 2 }).notNull(),
   paymentStatus: text('payment_status').default('unpaid').notNull(), // 'paid', 'unpaid'
   paymentMethod: text('payment_method').default('cash').notNull(), // 'cash', 'e-wallet', 'card'
   orderStatus: text('order_status').default('received').notNull(), // 'received', 'preparing', 'ready', 'completed', 'cancelled'
-  actionBy: text('action_by').default('System').notNull(), // Staff or Manager who processed it
+  actionBy: text('action_by').default('System').notNull(), // Staff who processed it
   stockReduced: boolean('stock_reduced').default(false).notNull(),
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').defaultNow(),
 });
 
-// Employee Audit Trails for employee actions (synced to cloud)
+// 5. NEW: Order Items Table (Normalized item splits for clean sales metrics)
+export const orderItems = pgTable('order_items', {
+  id: serial('id').primaryKey(),
+  orderId: text('order_id').notNull(), // Matches orders.id (UUID)
+  productId: text('product_id').notNull(), // Matches menuItems.id (UUID)
+  productName: text('product_name').notNull(),
+  price: numeric('price', { precision: 10, scale: 2 }).notNull(),
+  quantity: integer('quantity').notNull().default(1),
+});
+
+// 6. Employee Audit Trails
 export const auditLogs = pgTable('audit_logs', {
   id: text('id').primaryKey(), // Client-created stable UUID
+  sellerId: integer('seller_id'), // ADDED: Keeps logs mapped to their store
   employeeName: text('employee_name').notNull(),
   role: text('role').notNull(),
-  action: text('action').notNull(), // description of action
+  action: text('action').notNull(),
   timestamp: timestamp('timestamp').defaultNow(),
 });
 
-// Sellers table for custom registered accounts in Seller Portal
-export const sellers = pgTable('sellers', {
-  id: serial('id').primaryKey(),
-  email: text('email').notNull().unique(),
-  phone: text('phone').notNull(),
-  businessName: text('business_name').notNull(),
-  ownerName: text('owner_name').notNull(),
-  password: text('password').notNull(),
-  role: text('role').default('Manager/Owner').notNull(),
-  photoUrl: text('photo_url'),
-  createdAt: timestamp('created_at').defaultNow(),
-  updatedAt: timestamp('updated_at').defaultNow(),
-});
+// =========================================================================
+// DRIZZLE RELATIONS (For clean nested queries)
+// =========================================================================
 
+export const ordersRelations = relations(orders, ({ many }) => ({
+  items: many(orderItems),
+}));
+
+export const orderItemsRelations = relations(orderItems, ({ one }) => ({
+  order: one(orders, {
+    fields: [orderItems.orderId],
+    references: [orders.id],
+  }),
+  product: one(menuItems, {
+    fields: [orderItems.productId],
+    references: [menuItems.id],
+  }),
+}));
+
+export const staffRelations = relations(staff, ({ one }) => ({
+  user: one(users, {
+    fields: [staff.sellerId],
+    references: [users.sellerId],
+  }),
+}));

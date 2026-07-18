@@ -10,11 +10,16 @@
       "DOM.Iterable"
     ],
     "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
     "moduleResolution": "bundler",
     "isolatedModules": true,
     "moduleDetection": "force",
     "allowJs": true,
     "jsx": "react-jsx",
+    "jsxImportSource": "react",
+    "types": ["react", "react-dom", "jsonwebtoken"],
+    "typeRoots": ["./node_modules/@types"],
     "paths": {
       "@/*": [
         "./*"

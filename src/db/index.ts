@@ -17,8 +17,7 @@ const inMemoryStore: Record<string, any[]> = {
   staff: [],
   menu_items: [],
   orders: [],
-  audit_logs: [],
-  sellers: []
+  audit_logs: []
 };
 
 // Map of camelCase schema fields to MySQL snake_case table columns
@@ -148,6 +147,7 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
         \`phone\` VARCHAR(255) NULL,
         \`business_name\` VARCHAR(255) NULL,
         \`password\` VARCHAR(255) NULL,
+        \`pin\` VARCHAR(255) NULL,
         \`photo_url\` LONGTEXT NULL,
         \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -176,6 +176,7 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
     await safeAlter("ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(255) NULL");
     await safeAlter("ALTER TABLE `users` ADD COLUMN `business_name` VARCHAR(255) NULL");
     await safeAlter("ALTER TABLE `users` ADD COLUMN `password` VARCHAR(255) NULL");
+    await safeAlter("ALTER TABLE `users` ADD COLUMN `pin` VARCHAR(255) NULL");
     await safeAlter("ALTER TABLE `users` ADD COLUMN `photo_url` LONGTEXT NULL");
     await safeAlter("ALTER TABLE `users` ADD COLUMN `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
 
@@ -195,9 +196,17 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
         \`inventory_qty\` INT NOT NULL DEFAULT 0,
         \`sku\` VARCHAR(255) NULL,
         \`status\` VARCHAR(255) NOT NULL DEFAULT 'active',
-        \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        \`ingredients_json\` TEXT NULL,
+        \`allergens_json\` TEXT NULL,
+        \`image\` LONGTEXT NULL
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
+
+    await safeAlter("ALTER TABLE `menu_items` ADD COLUMN `ingredients_json` TEXT NULL");
+    await safeAlter("ALTER TABLE `menu_items` ADD COLUMN `allergens_json` TEXT NULL");
+    await safeAlter("ALTER TABLE `menu_items` ADD COLUMN `image` LONGTEXT NULL");
+    await safeAlter("ALTER TABLE `menu_items` MODIFY COLUMN `image` LONGTEXT NULL");
 
     await connection.query(`
       CREATE TABLE IF NOT EXISTS \`orders\` (
@@ -225,21 +234,6 @@ async function bootstrapMysqlTablesWithConnection(connection: any) {
         \`role\` VARCHAR(255) NOT NULL,
         \`action\` TEXT NOT NULL,
         \`timestamp\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    `);
-
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS \`sellers\` (
-        \`id\` INT AUTO_INCREMENT PRIMARY KEY,
-        \`email\` VARCHAR(255) NOT NULL UNIQUE,
-        \`phone\` VARCHAR(255) NOT NULL,
-        \`business_name\` VARCHAR(255) NOT NULL,
-        \`owner_name\` VARCHAR(255) NOT NULL,
-        \`password\` VARCHAR(255) NOT NULL,
-        \`role\` VARCHAR(255) NOT NULL DEFAULT 'Manager/Owner',
-        \`photo_url\` LONGTEXT NULL,
-        \`created_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        \`updated_at\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
@@ -312,11 +306,8 @@ async function tryConnectAndBootstrap() {
       }
     }
   } catch (err: any) {
-    if (!useInMemoryMock) {
-      console.warn('[Database] MySQL Workbench is offline or unreachable:', err.message);
-      console.log('[Database] Activating secure, resilient in-memory database fallback.');
-      useInMemoryMock = true;
-    }
+    console.warn('[Database] MySQL Workbench is offline or unreachable:', err.message);
+    console.log('[Database] MySQL is required for this app; please ensure the MySQL server is running.');
   }
 }
 
@@ -332,14 +323,31 @@ setInterval(() => {
 // Helper to identify table name from Drizzle table object
 function getTableName(tableObj: any): string {
   if (!tableObj) return '';
-  if (tableObj._ && tableObj._.name) return tableObj._.name;
-  if (tableObj.name) return tableObj.name;
+
+  const drizzleNameSymbol = Object.getOwnPropertySymbols(tableObj).find((s: symbol) => s.toString() === 'Symbol(drizzle:Name)');
+  const symbolName = tableObj?.[Symbol.for('drizzle:Name')] ?? (drizzleNameSymbol ? tableObj[drizzleNameSymbol] : undefined);
+  if (typeof symbolName === 'string' && symbolName) {
+    return symbolName;
+  }
+
+  const originalNameSymbol = Object.getOwnPropertySymbols(tableObj).find((s: symbol) => s.toString() === 'Symbol(drizzle:OriginalName)');
+  const originalName = tableObj?.[Symbol.for('drizzle:OriginalName')] ?? (originalNameSymbol ? tableObj[originalNameSymbol] : undefined);
+  if (typeof originalName === 'string' && originalName) {
+    return originalName;
+  }
+
+  const tableMetaSymbol = Object.getOwnPropertySymbols(tableObj).find((s: symbol) => s.toString() === 'Symbol(drizzle:Name)');
+  const tableMeta = tableMetaSymbol ? tableObj[tableMetaSymbol] : undefined;
+  if (typeof tableMeta === 'string' && tableMeta) {
+    return tableMeta;
+  }
+
+  if (tableObj?.name) return tableObj.name;
   if (tableObj === schema.users) return 'users';
   if (tableObj === schema.staff) return 'staff';
   if (tableObj === schema.menuItems) return 'menu_items';
   if (tableObj === schema.orders) return 'orders';
   if (tableObj === schema.auditLogs) return 'audit_logs';
-  if (tableObj === schema.sellers) return 'sellers';
   return '';
 }
 
@@ -351,20 +359,66 @@ function parseCondition(condition: any) {
     return { field, val };
   }
 
+  // Try to extract field name from various possible locations
   if (condition.left && typeof condition.left === 'object') {
     if (condition.left.name) {
       field = condition.left.name;
     }
   }
+
+  // Try to extract value from right side
   if (condition.right !== undefined) {
     const right = condition.right;
-    if (right && typeof right === 'object' && 'value' in right) {
-      val = right.value;
+    if (right && typeof right === 'object') {
+      if ('value' in right) {
+        val = right.value;
+      } else if (typeof right === 'object' && right.toString && right.toString().includes('Param')) {
+        // Might be a Param object
+        if ('value' in right) val = right.value;
+      } else {
+        val = right;
+      }
     } else {
       val = right;
     }
   } else if ('value' in condition) {
     val = (condition as any).value;
+  }
+
+  // Try extracting from queryChunks array
+  if (Array.isArray(condition.queryChunks)) {
+    const queryChunks = condition.queryChunks;
+    for (const chunk of queryChunks) {
+      if (!chunk || typeof chunk !== 'object') continue;
+      if (!field || field === 'id') {
+        if (typeof chunk.name === 'string' && chunk.name.trim()) {
+          field = chunk.name;
+        }
+      }
+      const constructorName = chunk.constructor?.name;
+      if (constructorName === 'Param' && 'value' in chunk && chunk.value !== undefined) {
+        val = chunk.value;
+        break;
+      }
+    }
+    if (val === null || val === undefined) {
+      for (const chunk of queryChunks) {
+        if (!chunk || typeof chunk !== 'object') continue;
+        if ('value' in chunk && chunk.value !== undefined && chunk.value !== null) {
+          const value = chunk.value;
+          if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (trimmed && trimmed !== '=' && trimmed.toUpperCase() !== 'WHERE') {
+              val = value;
+              break;
+            }
+          } else {
+            val = value;
+            break;
+          }
+        }
+      }
+    }
   }
 
   return { field, val };
@@ -383,8 +437,8 @@ function executeInMemoryInsert(tableName: string, values: any[], hasOnConflict: 
   for (const val of values) {
     const item = { ...val };
     
-    // Auto-generate ids for users / staff / sellers if missing
-    if (tableName === 'users' || tableName === 'staff' || tableName === 'sellers') {
+    // Auto-generate ids for users / staff if missing
+    if (tableName === 'users' || tableName === 'staff') {
       if (!item.id) {
         item.id = store.length + 1;
       }
@@ -395,8 +449,6 @@ function executeInMemoryInsert(tableName: string, values: any[], hasOnConflict: 
       conflictIndex = store.findIndex(x => x.uid === item.uid);
     } else if (tableName === 'staff' && item.uid) {
       conflictIndex = store.findIndex(x => x.uid === item.uid);
-    } else if (tableName === 'sellers' && item.email) {
-      conflictIndex = store.findIndex(x => x.email.toLowerCase() === item.email.toLowerCase());
     } else if (tableName === 'menu_items' && item.id) {
       conflictIndex = store.findIndex(x => x.id === item.id);
     } else if (tableName === 'orders' && item.id) {
@@ -459,6 +511,8 @@ const mysqlSelect = () => {
   let tableName = '';
   let conditionField = '';
   let conditionValue: any = null;
+  let limitValue: number | null = null;
+  let offsetValue: number | null = null;
 
   const builder = {
     from: (table: any) => {
@@ -471,59 +525,54 @@ const mysqlSelect = () => {
       conditionValue = val;
       return builder;
     },
+    limit: (value: number) => {
+      limitValue = value;
+      return builder;
+    },
+    offset: (value: number) => {
+      offsetValue = value;
+      return builder;
+    },
     then: (resolve?: any, reject?: any) => {
       const promise = (async () => {
-        if (useInMemoryMock) {
-          let rows = inMemoryStore[tableName] || [];
-          if (conditionField) {
-            rows = rows.filter(row => {
-              const rowVal = row[conditionField];
-              return rowVal === conditionValue;
-            });
-          }
-          return JSON.parse(JSON.stringify(rows));
+        if (!mysqlPool) {
+          await tryConnectAndBootstrap();
         }
 
-        try {
-          let sql = `SELECT ${selectFields} FROM \`${tableName}\``;
-          const params: any[] = [];
-          if (conditionField) {
-            const dbCondCol = camelToSnakeMap[conditionField] || conditionField;
-            sql += ` WHERE \`${dbCondCol}\` = ?`;
-            params.push(conditionValue);
-          }
-          const [rows] = await mysqlPool.execute(sql, params);
-          
-          const mapped = (rows as any[]).map(row => {
-            const mappedRow: Record<string, any> = {};
-            for (const key of Object.keys(row)) {
-              const camelKey = snakeToCamelMap[key] || key;
-              let v = row[key];
-              
-              if (camelKey === 'stockReduced') {
-                v = Boolean(v);
-              } else if (camelKey === 'itemsJson') {
-                if (typeof v !== 'string') {
-                  v = JSON.stringify(v);
-                }
-              }
-              mappedRow[camelKey] = v;
-            }
-            return mappedRow;
-          });
-          return mapped;
-        } catch (dbErr: any) {
-          console.warn(`[Database] Query failed on ${tableName}: ${dbErr.message}. Falling back to in-memory store.`);
-          useInMemoryMock = true;
-          let rows = inMemoryStore[tableName] || [];
-          if (conditionField) {
-            rows = rows.filter(row => {
-              const rowVal = row[conditionField];
-              return rowVal === conditionValue;
-            });
-          }
-          return JSON.parse(JSON.stringify(rows));
+        let sql = `SELECT ${selectFields} FROM \`${tableName}\``;
+        const params: any[] = [];
+        if (conditionField) {
+          const dbCondCol = camelToSnakeMap[conditionField] || conditionField;
+          sql += ` WHERE \`${dbCondCol}\` = ?`;
+          params.push(conditionValue);
         }
+        if (limitValue !== null) {
+          sql += ` LIMIT ${Number(limitValue)}`;
+        }
+        if (offsetValue !== null) {
+          sql += ` OFFSET ${Number(offsetValue)}`;
+        }
+
+        const [rows] = await mysqlPool.execute(sql, params);
+
+        const mapped = (rows as any[]).map(row => {
+          const mappedRow: Record<string, any> = {};
+          for (const key of Object.keys(row)) {
+            const camelKey = snakeToCamelMap[key] || key;
+            let v = row[key];
+
+            if (camelKey === 'stockReduced') {
+              v = Boolean(v);
+            } else if (camelKey === 'itemsJson') {
+              if (typeof v !== 'string') {
+                v = JSON.stringify(v);
+              }
+            }
+            mappedRow[camelKey] = v;
+          }
+          return mappedRow;
+        });
+        return mapped;
       })();
       return promise.then(resolve, reject);
     }
@@ -555,73 +604,75 @@ const mysqlInsert = (table: any) => {
         hasReturning: false,
         then: (resolve?: any, reject?: any) => {
           const promise = (async () => {
-            if (useInMemoryMock) {
-              return executeInMemoryInsert(tableName, valuesToInsert, chain.hasOnConflict, chain.conflictConfig);
+            if (!mysqlPool) {
+              await tryConnectAndBootstrap();
             }
 
-            try {
-              const results: any[] = [];
-              for (const val of valuesToInsert) {
-                const item = { ...val };
-                
-                // Convert camelCase parameters to snake_case table columns
-                const dbRow: Record<string, any> = {};
-                for (const key of Object.keys(item)) {
-                  const dbCol = camelToSnakeMap[key] || key;
-                  let v = item[key];
-                  if (typeof v === 'boolean') {
-                    dbRow[dbCol] = v ? 1 : 0;
-                  } else if (v instanceof Date) {
-                    dbRow[dbCol] = v.toISOString().slice(0, 19).replace('T', ' ');
-                  } else {
-                    dbRow[dbCol] = v;
-                  }
+            const results: any[] = [];
+            for (const val of valuesToInsert) {
+              const item = { ...val };
+              
+              // Convert camelCase parameters to snake_case table columns
+              const dbRow: Record<string, any> = {};
+              for (const key of Object.keys(item)) {
+                const dbCol = camelToSnakeMap[key] || key;
+                let v = item[key];
+                if (typeof v === 'boolean') {
+                  dbRow[dbCol] = v ? 1 : 0;
+                } else if (v instanceof Date) {
+                  dbRow[dbCol] = v.toISOString().slice(0, 19).replace('T', ' ');
+                } else {
+                  dbRow[dbCol] = v;
                 }
-
-                const keys = Object.keys(dbRow);
-                const columns = keys.map(k => `\`${k}\``).join(', ');
-                const placeholders = keys.map(() => '?').join(', ');
-                const params = keys.map(k => dbRow[k]);
-
-                let sql = `INSERT INTO \`${tableName}\` (${columns}) VALUES (${placeholders})`;
-                
-                if (chain.hasOnConflict && chain.conflictConfig) {
-                  const setObj = chain.conflictConfig.set;
-                  const setKeys = Object.keys(setObj);
-                  if (setKeys.length > 0) {
-                    const updateParts: string[] = [];
-                    for (const k of setKeys) {
-                      const dbCol = camelToSnakeMap[k] || k;
-                      updateParts.push(`\`${dbCol}\` = ?`);
-                      
-                      let v = setObj[k];
-                      if (typeof v === 'boolean') {
-                        params.push(v ? 1 : 0);
-                      } else if (v instanceof Date) {
-                        params.push(v.toISOString().slice(0, 19).replace('T', ' '));
-                      } else {
-                        params.push(v);
-                      }
-                    }
-                    sql += ` ON DUPLICATE KEY UPDATE ${updateParts.join(', ')}`;
-                  }
-                }
-
-                const [resHeader]: any = await mysqlPool.execute(sql, params);
-                
-                if (tableName === 'users' || tableName === 'staff') {
-                  if (!item.id && resHeader.insertId) {
-                    item.id = resHeader.insertId;
-                  }
-                }
-                results.push(item);
               }
-              return results;
-            } catch (dbErr: any) {
-              console.warn(`[Database] Insert failed on ${tableName}: ${dbErr.message}. Falling back to in-memory store.`);
-              useInMemoryMock = true;
-              return executeInMemoryInsert(tableName, valuesToInsert, chain.hasOnConflict, chain.conflictConfig);
+
+              const keys = Object.keys(dbRow);
+              const columns = keys.map(k => `\`${k}\``).join(', ');
+              const placeholders = keys.map(() => '?').join(', ');
+              const params = keys.map(k => dbRow[k]);
+
+              let sql = `INSERT INTO \`${tableName}\` (${columns}) VALUES (${placeholders})`;
+              
+              if (chain.hasOnConflict && chain.conflictConfig) {
+                const setObj = chain.conflictConfig.set;
+                const setKeys = Object.keys(setObj);
+                if (setKeys.length > 0) {
+                  const updateParts: string[] = [];
+                  for (const k of setKeys) {
+                    const dbCol = camelToSnakeMap[k] || k;
+                    updateParts.push(`\`${dbCol}\` = ?`);
+                    
+                    let v = setObj[k];
+                    if (typeof v === 'boolean') {
+                      params.push(v ? 1 : 0);
+                    } else if (v instanceof Date) {
+                      params.push(v.toISOString().slice(0, 19).replace('T', ' '));
+                    } else {
+                      params.push(v);
+                    }
+                  }
+                  sql += ` ON DUPLICATE KEY UPDATE ${updateParts.join(', ')}`;
+                }
+              } else if (tableName === 'menu_items') {
+                const updateCols = keys.filter(k => k !== 'id');
+                if (updateCols.length > 0) {
+                  const updateParts = updateCols.map(k => `\`${k}\` = VALUES(\`${k}\`)`).join(', ');
+                  sql += ` ON DUPLICATE KEY UPDATE ${updateParts}`;
+                } else {
+                  sql += ` ON DUPLICATE KEY UPDATE \`id\` = \`id\``;
+                }
+              }
+
+              const [resHeader]: any = await mysqlPool.execute(sql, params);
+              
+              if (tableName === 'users' || tableName === 'staff') {
+                if (!item.id && resHeader.insertId) {
+                  item.id = resHeader.insertId;
+                }
+              }
+              results.push(item);
             }
+            return results;
           })();
           return promise.then(resolve, reject);
         }
@@ -651,13 +702,13 @@ const mysqlUpdate = (table: any) => {
       return builder;
     },
     then: (resolve?: any, reject?: any) => {
-      const promise = (async () => {
-        if (useInMemoryMock) {
-          return executeInMemoryUpdate(tableName, setData, conditionField, conditionValue);
-        }
-
+      return (async () => {
         try {
-          const keys = Object.keys(setData);
+          if (!mysqlPool) {
+            await tryConnectAndBootstrap();
+          }
+
+          const keys = Object.keys(setData || {});
           const updateParts: string[] = [];
           const params: any[] = [];
           for (const k of keys) {
@@ -681,14 +732,16 @@ const mysqlUpdate = (table: any) => {
           }
 
           const [res] = await mysqlPool.execute(sql, params);
+          if (resolve) resolve(res);
           return res;
-        } catch (dbErr: any) {
-          console.warn(`[Database] Update failed on ${tableName}: ${dbErr.message}. Falling back to in-memory store.`);
-          useInMemoryMock = true;
-          return executeInMemoryUpdate(tableName, setData, conditionField, conditionValue);
+        } catch (err) {
+          if (reject) reject(err);
+          else throw err;
         }
       })();
-      return promise.then(resolve, reject);
+    },
+    catch: (fn?: any) => {
+      return builder;
     }
   };
   return builder;
@@ -708,12 +761,12 @@ const mysqlDelete = (table: any) => {
       return builder;
     },
     then: (resolve?: any, reject?: any) => {
-      const promise = (async () => {
-        if (useInMemoryMock) {
-          return executeInMemoryDelete(tableName, conditionField, conditionValue);
-        }
-
+      return (async () => {
         try {
+          if (!mysqlPool) {
+            await tryConnectAndBootstrap();
+          }
+
           let sql = `DELETE FROM \`${tableName}\``;
           const params: any[] = [];
           if (conditionField) {
@@ -722,14 +775,16 @@ const mysqlDelete = (table: any) => {
             params.push(conditionValue);
           }
           const [res] = await mysqlPool.execute(sql, params);
+          if (resolve) resolve(res);
           return res;
-        } catch (dbErr: any) {
-          console.warn(`[Database] Delete failed on ${tableName}: ${dbErr.message}. Falling back to in-memory store.`);
-          useInMemoryMock = true;
-          return executeInMemoryDelete(tableName, conditionField, conditionValue);
+        } catch (err) {
+          if (reject) reject(err);
+          else throw err;
         }
       })();
-      return promise.then(resolve, reject);
+    },
+    catch: (fn?: any) => {
+      return builder;
     }
   };
   return builder;
